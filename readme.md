@@ -118,6 +118,14 @@ Basic usage:
   Show what would be done, **without** actually writing any files.  
   Useful to review changes before applying them.
 
+- `--restore`  
+  Restore the latest backups for `/etc/sudoers`, `/etc/sudoers.d/<user>-passwordless`, and `/etc/polkit-1/rules.d/00-allow-<user>-everything.rules` (if they exist).  
+  Useful for rolling back changes made by this script.
+
+- `--verify-only` / `--verify`  
+  Run verification checks only: confirm that passwordless sudo works for the target user, and (if not using `--sudo-only`) run a best-effort polkit sanity check.  
+  Makes no configuration changes.
+
 - `-h`, `--help`  
   Print usage and exit.
 
