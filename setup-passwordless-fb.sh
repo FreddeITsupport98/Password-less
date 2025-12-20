@@ -42,6 +42,8 @@ force=0
 dry_run=0
 sudo_only=0
 no_install=0
+restore_mode=0
+verify_only=0
 TARGET_USER=""
 POLKIT_TMP=""
 
@@ -58,6 +60,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-install)
       no_install=1
+      shift
+      ;;
+    --restore)
+      restore_mode=1
+      shift
+      ;;
+    --verify-only|--verify)
+      verify_only=1
       shift
       ;;
     --yes)
@@ -208,6 +218,27 @@ backup_if_exists() {
   fi
 }
 
+restore_latest_backup_for() {
+  # Restore the most recent .bak.* for the given path, if any.
+  local path="$1"
+  local pattern="${path}.bak.*"
+  local latest
+
+  latest="$(ls -1t $pattern 2>/dev/null | head -n1 || true)"
+  if [[ -z "$latest" ]]; then
+    log "[restore] No backups found for $path (pattern: $pattern); skipping."
+    return 0
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would restore $path from latest backup $latest"
+    return 0
+  fi
+
+  warn "Restoring $path from backup $latest"
+  sudo install -o root -g root -m "$(stat -c '%a' "$latest" 2>/dev/null || echo 440)" "$latest" "$path"
+}
+
 write_root_file() {
   local tmp="$1"
   local dest="$2"
@@ -221,6 +252,67 @@ write_root_file() {
   fi
 
   sudo install -o root -g root -m "$mode" "$tmp" "$dest"
+}
+
+ensure_main_sudoers_has_user_nopasswd() {
+  # Ensure /etc/sudoers itself also has a NOPASSWD line for TARGET_USER.
+  # This is in addition to the drop-in in /etc/sudoers.d, and uses visudo
+  # for syntax checking before installing.
+  local main="/etc/sudoers"
+  local tmp
+
+  # If /etc/sudoers is missing, do nothing (that would be a badly broken system).
+  if ! sudo test -e "$main"; then
+    warn "Main sudoers file $main not found; skipping direct edit."
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+
+  # Copy current sudoers to a temp file we can edit.
+  if ! sudo cp "$main" "$tmp"; then
+    rm -f "$tmp"
+    warn "Could not copy $main; skipping direct edit."
+    return 0
+  fi
+
+  # If an equivalent NOPASSWD line for the user already exists (with or without :ALL), skip.
+  if sudo grep -Eq "^${TARGET_USER}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:?[[:space:]]+ALL" "$tmp"; then
+    log "[info] Main sudoers already has a NOPASSWD line for $TARGET_USER; skipping."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # Also guard against re-appending our own marker block if someone reformatted the line
+  # but left the comment.
+  if sudo grep -Fq "# Added by $SCRIPT_NAME for passwordless sudo for $TARGET_USER" "$tmp"; then
+    log "[info] Marker comment for $TARGET_USER already present in $main; not adding another block."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  {
+    printf '\n# Added by %s for passwordless sudo for %s\n' "$SCRIPT_NAME" "$TARGET_USER"
+    printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$TARGET_USER"
+  } >>"$tmp"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would validate sudoers via: sudo $VISUDO_BIN -c -f $tmp"
+    log "[dry-run] Would update $main with a NOPASSWD line for $TARGET_USER"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # Validate new sudoers content before installing.
+  if ! sudo "$VISUDO_BIN" -c -f "$tmp"; then
+    rm -f "$tmp"
+    die "New /etc/sudoers content with $TARGET_USER NOPASSWD failed visudo check; not installing."
+  fi
+
+  # Backup and install the validated file.
+  backup_if_exists "$main"
+  sudo install -o root -g root -m 0440 "$tmp" "$main"
+  rm -f "$tmp"
 }
 
 find_visudo() {
@@ -277,21 +369,59 @@ if [[ "$TARGET_USER" == "root" ]]; then
   die "Refusing to configure passwordless access for root."
 fi
 
-install_deps_if_missing
 require_sudo
+
+# Only attempt to install dependencies when actually configuring, not when
+# running in restore/verify-only modes.
+if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
+  install_deps_if_missing
+fi
 
 VISUDO_BIN="$(find_visudo)"
 [[ -n "$VISUDO_BIN" ]] || die "visudo not found. Install sudo/visudo and ensure it's available (often in /usr/sbin)."
 
 log "[info] Target user: $TARGET_USER"
 
-if [[ "$dry_run" -eq 0 ]]; then
+# If running in restore mode, restore backups and exit.
+if [[ "$restore_mode" -eq 1 ]]; then
+  log "[restore] Restoring latest backups for sudoers, sudoers.d, and polkit (where present) for $TARGET_USER..."
+  restore_latest_backup_for "/etc/sudoers"
+  restore_latest_backup_for "/etc/sudoers.d/${TARGET_USER}-passwordless"
+  restore_latest_backup_for "/etc/polkit-1/rules.d/00-allow-${TARGET_USER}-everything.rules"
+  log "[restore] Done. You may want to run: sudo visudo -c"
+  exit 0
+fi
+
+if [[ "$dry_run" -eq 0 && "$verify_only" -eq 0 ]]; then
   warn "This will grant '$TARGET_USER' root-equivalent access without a password."
   if ! confirm "Continue?"; then
     die "Aborted."
   fi
-else
+elif [[ "$dry_run" -eq 1 ]]; then
   warn "Dry run mode enabled; no changes will be written."
+fi
+
+# If running verify-only, just run the checks and exit.
+if [[ "$verify_only" -eq 1 ]]; then
+  log "[verify] Checking passwordless sudo for $TARGET_USER..."
+  if sudo -u "$TARGET_USER" -H bash -lc 'sudo -n true' >/dev/null 2>&1; then
+    log "[verify] OK: sudo is passwordless for $TARGET_USER."
+  else
+    die "[verify] sudo still requires a password for $TARGET_USER."
+  fi
+
+  if [[ "$sudo_only" -eq 0 ]]; then
+    if have_cmd pkcheck; then
+      log "[verify] Running pkcheck sanity check for $TARGET_USER (may fail harmlessly if action-id isn't present)..."
+      # This is a best-effort check, not a hard failure.
+      pkcheck --action-id org.freedesktop.policykit.exec --process $$ --allow-user-interaction=false >/dev/null 2>&1 || true
+    else
+      warn "[verify] pkcheck not found; skipping polkit verification."
+    fi
+  fi
+
+  log "[verify] Done."
+  exit 0
 fi
 
 # --- Configure sudoers drop-in ---
@@ -345,6 +475,10 @@ else
     die "sudo still requires a password for $TARGET_USER. Inspect $SUDOERS_DEST and /etc/sudoers.d/."
   fi
 fi
+
+# Also ensure /etc/sudoers itself has the NOPASSWD line for this user.
+log "[2b/3] Ensuring /etc/sudoers has NOPASSWD for $TARGET_USER..."
+ensure_main_sudoers_has_user_nopasswd
 
 # --- Configure polkit rule (optional) ---
 if [[ "$sudo_only" -eq 1 ]]; then
