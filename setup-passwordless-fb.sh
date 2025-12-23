@@ -254,6 +254,32 @@ write_root_file() {
   sudo install -o root -g root -m "$mode" "$tmp" "$dest"
 }
 
+ensure_sudoers_permissions() {
+  # Some distros (e.g. openSUSE) ship a primary sudoers file in /usr/etc/sudoers
+  # which visudo -c will validate. If that file has overly permissive
+  # permissions, visudo will fail even if our drop-in is fine. Normalize
+  # ownership and mode on the core sudoers files before running visudo.
+  local path
+  for path in /etc/sudoers /usr/etc/sudoers; do
+    if sudo test -e "$path"; then
+      local owner group mode
+      owner=$(sudo stat -c '%U' "$path" 2>/dev/null || echo "")
+      group=$(sudo stat -c '%G' "$path" 2>/dev/null || echo "")
+      mode=$(sudo stat -c '%a' "$path" 2>/dev/null || echo "")
+
+      if [[ "$owner" != "root" || "$group" != "root" || "$mode" != "440" ]]; then
+        warn "Fixing permissions on $path (owner=${owner:-?}:${group:-?} mode=${mode:-?}, expected root:root 440)..."
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would chown root:root \"$path\" and chmod 0440 \"$path\""
+        else
+          sudo chown root:root "$path"
+          sudo chmod 0440 "$path"
+        fi
+      fi
+    fi
+  done
+}
+
 ensure_main_sudoers_has_user_nopasswd() {
   # Ensure /etc/sudoers itself also has a NOPASSWD line for TARGET_USER.
   # This is in addition to the drop-in in /etc/sudoers.d, and uses visudo
@@ -379,6 +405,10 @@ fi
 
 VISUDO_BIN="$(find_visudo)"
 [[ -n "$VISUDO_BIN" ]] || die "visudo not found. Install sudo/visudo and ensure it's available (often in /usr/sbin)."
+
+# Ensure core sudoers files have safe permissions so visudo -c does not
+# fail with "bad permissions, should be mode 0440".
+ensure_sudoers_permissions
 
 log "[info] Target user: $TARGET_USER"
 
