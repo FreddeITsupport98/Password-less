@@ -377,6 +377,30 @@ restart_polkit_best_effort() {
   return 1
 }
 
+configure_kdesu_for_sudo() {
+  # On KDE, configure the graphical "Run as root" helper (kdesu) to use sudo
+  # instead of su, so it respects the passwordless sudo we just set up.
+  # This is a no-op on non-KDE systems or when kwriteconfig5 is missing.
+  if ! have_cmd kwriteconfig5; then
+    return 0
+  fi
+
+  # Only attempt this when running under a KDE/Plasma session.
+  local desktop="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
+  if [[ "$desktop" != *KDE* && "$desktop" != *plasma* && "$desktop" != *Plasma* ]]; then
+    return 0
+  fi
+
+  log "[info] Configuring KDE 'Run as root' helper (kdesu) to use sudo..."
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would run: kwriteconfig5 --file kdesurc --group super-user-command --key super-user-command sudo"
+  else
+    if ! kwriteconfig5 --file kdesurc --group super-user-command --key super-user-command sudo; then
+      warn "Failed to configure kdesu to use sudo via kwriteconfig5"
+    fi
+  fi
+}
+
 # --- Sanity checks ---
 if [[ "$(id -u)" -eq 0 ]]; then
   die "Do not run as root. Run as the target user with sudo access."
@@ -582,6 +606,9 @@ if have_cmd pkcheck; then
 else
   warn "pkcheck not found; skipping polkit sanity check."
 fi
+
+# KDE integration: make the GUI "Run as root" helper use sudo instead of su.
+configure_kdesu_for_sudo
 
 log "Done."
 log "To undo: remove $SUDOERS_DEST and $POLKIT_RULE_PATH (and any .bak.* backups you created)."
