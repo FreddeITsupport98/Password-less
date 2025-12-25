@@ -393,14 +393,9 @@ relax_mac_controls_if_requested() {
     return 0
   fi
 
-  # In verify-only mode, never change MAC settings; just report when requested.
+  # In verify-only mode, never change MAC settings; just report status.
   if [[ "$verify_only" -ne 0 ]]; then
-    if [[ "$relax_mac" -eq 0 ]]; then
-      log "[info] Verify-only: not checking AppArmor/SELinux (no --relax-mac flag)."
-      return 0
-    fi
-
-    log "[verify] MAC status (no changes will be made):"
+    log "[verify] MAC status (informational only; no changes will be made):"
 
     # AppArmor status (best-effort).
     local aa_present="no"
