@@ -121,7 +121,7 @@ chmod +x setup-passwordless-fb.sh
 Basic usage:
 
 ```bash
-./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run]
+./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run]
 ```
 
 ### Options
@@ -141,6 +141,13 @@ Basic usage:
 - `--no-install`  
   Do **not** attempt to install missing dependencies (e.g. `polkit`).  
   If dependencies are missing, the script will abort and ask you to install them yourself.
+
+- `--relax-mac`  
+  **Dangerous, optional**: best-effort attempt to relax Mandatory Access Control (MAC) systems:
+  - Stop the AppArmor service at runtime (if present).  
+  - Set SELinux to **permissive** at runtime (if present).  
+  This does **not** change UIDs/groups/sudoers, but it removes important enforcement layers, making any existing privileges more powerful.  
+  The script will still prompt you for confirmation unless `--yes` is also provided.
 
 - `--yes`  
   Non-interactive mode. Assume “yes” to prompts where applicable.
