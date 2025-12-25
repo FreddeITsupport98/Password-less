@@ -385,13 +385,54 @@ restart_polkit_best_effort() {
 }
 
 relax_mac_controls_if_requested() {
-  # Optionally relax MAC (AppArmor/SELinux) controls.
+  # Optionally relax MAC (AppArmor/SELinux) controls or report their status.
   # This does NOT change user IDs or sudoers, but it removes important
   # enforcement layers. It is therefore disabled by default and only
   # runs when --relax-mac is explicitly provided.
-  if [[ "$restore_mode" -ne 0 || "$verify_only" -ne 0 ]]; then
+  if [[ "$restore_mode" -ne 0 ]]; then
     return 0
   fi
+
+  # In verify-only mode, never change MAC settings; just report when requested.
+  if [[ "$verify_only" -ne 0 ]]; then
+    if [[ "$relax_mac" -eq 0 ]]; then
+      log "[info] Verify-only: not checking AppArmor/SELinux (no --relax-mac flag)."
+      return 0
+    fi
+
+    log "[verify] MAC status (no changes will be made):"
+
+    # AppArmor status (best-effort).
+    local aa_present="no"
+    local aa_active="unknown"
+    if have_cmd systemctl; then
+      if systemctl list-unit-files 2>/dev/null | grep -q '^apparmor\\.service'; then
+        aa_present="yes"
+        aa_active="$(systemctl is-active apparmor 2>/dev/null || echo "unknown")"
+      fi
+    fi
+    log "[verify] AppArmor present: $aa_present, active: $aa_active"
+
+    # SELinux status (best-effort).
+    local se_mode="not-detected"
+    if have_cmd getenforce; then
+      se_mode="$(getenforce 2>/dev/null || echo "unknown")"
+    elif [[ -f /sys/fs/selinux/enforce ]]; then
+      local cur_val
+      cur_val="$(cat /sys/fs/selinux/enforce 2>/dev/null || echo "")"
+      if [[ "$cur_val" == "1" ]]; then
+        se_mode="Enforcing"
+      elif [[ "$cur_val" == "0" ]]; then
+        se_mode="Permissive"
+      else
+        se_mode="unknown($cur_val)"
+      fi
+    fi
+    log "[verify] SELinux mode: $se_mode"
+
+    return 0
+  fi
+
   if [[ "$relax_mac" -eq 0 ]]; then
     log "[info] Not changing AppArmor/SELinux (no --relax-mac flag)."
     return 0
@@ -409,7 +450,7 @@ relax_mac_controls_if_requested() {
 
   # Best-effort AppArmor handling (systemd-based systems).
   if have_cmd systemctl; then
-    if systemctl list-unit-files 2>/dev/null | grep -q '^apparmor\.service'; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^apparmor\\.service'; then
       log "[info] Attempting to stop AppArmor service (runtime-only)."
       if [[ "$dry_run" -eq 1 ]]; then
         log "[dry-run] Would run: sudo systemctl stop apparmor"
@@ -514,10 +555,10 @@ if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
       fi
     fi
   done
-
-  # Optionally relax MAC (AppArmor/SELinux) controls, if explicitly requested.
-  relax_mac_controls_if_requested
 fi
+
+# Optionally relax MAC (AppArmor/SELinux) controls or report their status.
+relax_mac_controls_if_requested
 
 VISUDO_BIN="$(find_visudo)"
 [[ -n "$VISUDO_BIN" ]] || die "visudo not found. Install sudo/visudo and ensure it's available (often in /usr/sbin)."
