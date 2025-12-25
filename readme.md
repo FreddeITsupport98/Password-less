@@ -11,20 +11,55 @@ This repository provides:
   - Is **safe** by design: uses `visudo` for syntax validation and makes backups before replacing system files
   - Is **idempotent**: re-running the script does **not** keep appending duplicate lines
 
-## ⚠️ Security Warning
+## ⚠️ Security Warnings & Disclaimer
 
-This script gives the target user essentially **root-equivalent power without any password prompt**.
+This script gives the target user essentially **root-equivalent power without any password prompt** and may also add them to highly privileged system groups (such as `root`, `disk`, `shadow`, and `kmem`).
 
 - The target user can run **any command** as root with `sudo` without being asked for a password.
 - If polkit configuration is enabled (default), that user will also get **automatic approval** for polkit-controlled actions (e.g. graphical administrative actions).
+- If group membership is modified, the target user may gain **direct access to disks, kernel interfaces, and sensitive files (including password hashes)** even *without* `sudo`.
 
-You should:
+### You must assume:
 
-- Only use this on **systems you control** and fully trust the target user.
-- Understand the implications for **security, auditing, and multi-user setups**.
-- Prefer using this on **personal machines**, labs, VMs, or development environments, not shared production systems.
+- **Full system compromise** is possible if this user account is ever abused or compromised.
+- Local malware running as that user can trivially escalate to **full root**.
+- Traditional protections such as `sudo` password prompts and some polkit dialogs will no longer provide meaningful defense.
 
-Use at your own risk.
+### Recommended extra precautions
+
+Before using this script, **read and understand** all of the following:
+
+1. **Single-user, non-critical systems only**  
+   Use this only on machines where you are the **sole user** and there is no untrusted local user. Avoid production servers or shared multi-user systems.
+
+2. **Physical and account security**  
+   - Use a strong login passphrase for the target account and full disk encryption where possible.  
+   - Lock your screen when unattended.  
+   - Do not reuse the same password on other systems/services.
+
+3. **Network and remote access**  
+   - Be extremely careful enabling SSH or other remote access for this user.  
+   - If you must, use key-based auth, disable password login, and restrict who can connect (firewall, `AllowUsers`, etc.).
+
+4. **Limit browser and untrusted software risk**  
+   - Treat running a web browser, email client, or untrusted binaries under this account as if you are running them as **root**.  
+   - Avoid executing random scripts from the internet. Review them first.
+
+5. **Backups and recovery**  
+   - Keep known-good backups of `/etc/sudoers`, `/etc/sudoers.d/`, and any polkit rules.  
+   - Consider creating a second, more restricted admin account you can fall back to.
+
+6. **Log out / reboot after changes**  
+   - After group membership changes, log out and back in (or reboot) to ensure group changes take effect and test carefully.
+
+### Legal / warranty disclaimer
+
+- This script and documentation are provided **“as is”**, **without any warranty** of any kind, express or implied.  
+- **I am not the original author of this script** and make **no guarantees** about its safety, correctness, fitness for a particular purpose, or suitability for your environment.  
+- You are solely responsible for **reviewing the code**, understanding what it does, and deciding whether it is appropriate to run on your systems.  
+- By using this script, **you accept all risk**, including but not limited to data loss, security breaches, service outages, and legal or policy violations.
+
+If you do not fully understand or accept these risks, **do not run this script**.
 
 ---
 

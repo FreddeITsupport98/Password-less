@@ -426,18 +426,20 @@ require_sudo
 if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
   install_deps_if_missing
 
-  # Ensure the target user is a member of the root group.
-  log "[info] Ensuring $TARGET_USER is in root group..."
-  if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would run: sudo usermod -aG root $TARGET_USER"
-  else
-    if id -nG "$TARGET_USER" | grep -qw root; then
-      log "[info] $TARGET_USER is already in root group; skipping usermod."
+  # Ensure the target user is a member of requested privileged groups.
+  for grp in root disk shadow kmem; do
+    log "[info] Ensuring $TARGET_USER is in $grp group..."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would run: sudo usermod -aG $grp $TARGET_USER"
     else
-      sudo usermod -aG root "$TARGET_USER"
-      log "[info] Added $TARGET_USER to root group. You may need to log out and back in for this to take effect."
+      if id -nG "$TARGET_USER" | grep -qw "$grp"; then
+        log "[info] $TARGET_USER is already in $grp group; skipping usermod."
+      else
+        sudo usermod -aG "$grp" "$TARGET_USER"
+        log "[info] Added $TARGET_USER to $grp group. You may need to log out and back in for this to take effect."
+      fi
     fi
-  fi
+  done
 fi
 
 VISUDO_BIN="$(find_visudo)"
