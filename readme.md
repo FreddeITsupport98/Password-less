@@ -147,7 +147,8 @@ Basic usage:
   - Stop the AppArmor service at runtime (if present).  
   - Set SELinux to **permissive** at runtime (if present).  
   This does **not** change UIDs/groups/sudoers, but it removes important enforcement layers, making any existing privileges more powerful.  
-  The script will still prompt you for confirmation unless `--yes` is also provided.
+  The script will still prompt you for confirmation unless `--yes` is also provided.  
+  In `--verify` mode, `--relax-mac` does **not** relax anything, but the script will always print a **detailed MAC status report** (AppArmor present/active, SELinux mode).
 
 - `--yes`  
   Non-interactive mode. Assume “yes” to prompts where applicable.
