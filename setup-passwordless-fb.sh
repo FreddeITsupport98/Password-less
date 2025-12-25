@@ -44,6 +44,7 @@ sudo_only=0
 no_install=0
 restore_mode=0
 verify_only=0
+relax_mac=0
 TARGET_USER=""
 POLKIT_TMP=""
 
@@ -60,6 +61,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-install)
       no_install=1
+      shift
+      ;;
+    --relax-mac)
+      # Best-effort: disable AppArmor service (if present) and set SELinux to permissive.
+      # Requires explicit opt-in; will still ask for confirmation unless --yes is set.
+      relax_mac=1
       shift
       ;;
     --restore)
@@ -377,6 +384,73 @@ restart_polkit_best_effort() {
   return 1
 }
 
+relax_mac_controls_if_requested() {
+  # Optionally relax MAC (AppArmor/SELinux) controls.
+  # This does NOT change user IDs or sudoers, but it removes important
+  # enforcement layers. It is therefore disabled by default and only
+  # runs when --relax-mac is explicitly provided.
+  if [[ "$restore_mode" -ne 0 || "$verify_only" -ne 0 ]]; then
+    return 0
+  fi
+  if [[ "$relax_mac" -eq 0 ]]; then
+    log "[info] Not changing AppArmor/SELinux (no --relax-mac flag)."
+    return 0
+  fi
+
+  warn "You requested to relax mandatory access controls (AppArmor/SELinux)."
+  warn "This weakens system security by removing additional enforcement layers."
+
+  if [[ "$assume_yes" -eq 0 ]]; then
+    if ! confirm "Disable AppArmor service (if present) and set SELinux to permissive at runtime?"; then
+      log "[info] Skipping MAC relaxation at your request."
+      return 0
+    fi
+  fi
+
+  # Best-effort AppArmor handling (systemd-based systems).
+  if have_cmd systemctl; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^apparmor\.service'; then
+      log "[info] Attempting to stop AppArmor service (runtime-only)."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: sudo systemctl stop apparmor"
+      else
+        sudo systemctl stop apparmor 2>/dev/null || warn "Failed to stop AppArmor service (it may not be active)."
+      fi
+    fi
+  fi
+
+  # Best-effort SELinux: set to permissive at runtime.
+  if have_cmd getenforce; then
+    cur_mode="$(getenforce 2>/dev/null || echo "")"
+    if [[ "$cur_mode" == "Enforcing" ]]; then
+      log "[info] Setting SELinux to permissive via setenforce 0 (runtime-only)."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: sudo setenforce 0"
+      else
+        sudo setenforce 0 2>/dev/null || warn "Failed to set SELinux to permissive via setenforce."
+      fi
+    else
+      log "[info] SELinux mode is '$cur_mode'; not changing."
+    fi
+  elif [[ -f /sys/fs/selinux/enforce ]]; then
+    cur_val="$(cat /sys/fs/selinux/enforce 2>/dev/null || echo "")"
+    if [[ "$cur_val" == "1" ]]; then
+      log "[info] Attempting to set SELinux to permissive by writing to /sys/fs/selinux/enforce."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: echo 0 | sudo tee /sys/fs/selinux/enforce"
+      else
+        echo 0 | sudo tee /sys/fs/selinux/enforce >/dev/null 2>&1 || warn "Failed to write to /sys/fs/selinux/enforce."
+      fi
+    else
+      log "[info] SELinux enforce file value is '$cur_val'; not changing."
+    fi
+  else
+    log "[info] SELinux not detected; nothing to relax."
+  fi
+
+  warn "MAC relaxation (if any) was applied at runtime only. Persistent boot-time settings were NOT modified."
+}
+
 configure_kdesu_for_sudo() {
   # On KDE, configure the graphical "Run as root" helper (kdesu) to use sudo
   # instead of su, so it respects the passwordless sudo we just set up.
@@ -440,6 +514,9 @@ if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
       fi
     fi
   done
+
+  # Optionally relax MAC (AppArmor/SELinux) controls, if explicitly requested.
+  relax_mac_controls_if_requested
 fi
 
 VISUDO_BIN="$(find_visudo)"
