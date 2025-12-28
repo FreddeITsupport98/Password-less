@@ -31,7 +31,7 @@ This script gives the target user essentially **root-equivalent power without an
 
 In addition to configuring passwordless sudo and (optionally) polkit, this script can:
 
-- Add the target user to **highly privileged system groups** such as `root`, `disk`, `shadow`, `kmem`, and `wheel`.  
+- Add the target user to **highly privileged system groups** such as `root`, `disk`, `shadow`, `kmem`, `wheel`, `adm`, and `systemd-journal`.  
   This can give the user **direct access to raw disks, password hashes, kernel interfaces and system configuration**, even **without** using `sudo`.
 - Optionally **relax mandatory access controls (MAC)** when `--relax-mac` is used, by stopping AppArmor (if present) and attempting to switch SELinux to **permissive** mode.  
   This removes an important layer of defense on top of normal Unix permissions and sudo.
