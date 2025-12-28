@@ -33,6 +33,7 @@ In addition to configuring passwordless sudo and (optionally) polkit, this scrip
 
 - Add the target user to **highly privileged system groups** such as `root`, `disk`, `wheel`, `systemd-journal`, `network`, `video`, `audio`, `input`, `render`, `kvm`, `tty`, `tape`, `shadow`, `kmem`, and `adm`.  
   This can give the user **direct access to raw disks, password hashes, kernel interfaces and system configuration**, even **without** using `sudo`.
+  The script will **only** add the user to groups that **actually exist** on the system (as returned by `getent group`). If you later install software that creates additional groups from this list and re-run the script, it will then add the user to those newly-present groups as well.
 - Optionally **relax mandatory access controls (MAC)** when `--relax-mac` is used, by stopping AppArmor (if present) and attempting to switch SELinux to **permissive** mode.  
   This removes an important layer of defense on top of normal Unix permissions and sudo.
 - Optionally configure polkit so that the user receives **automatic approval for all polkit actions** (no graphical confirmation dialogs).
