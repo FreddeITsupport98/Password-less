@@ -174,6 +174,11 @@ Basic usage:
   The script will still prompt you for confirmation unless `--yes` is also provided.  
   In `--verify` mode, `--relax-mac` does **not** relax anything, but the script will always print a **detailed MAC status report** (AppArmor present/active, SELinux mode).
 
+- `--all-groups`  
+  **Extremely dangerous**: enumerate **every group** on the system via `getent group` and add the target user to all of them (except those they are already a member of).  
+  This effectively removes almost all group-based isolation between the user and system services, daemons, and device nodes.  
+  Use this only if you fully understand that it turns the user into a "member of everything" and are prepared to reinstall the system if something breaks.
+
 - `--yes`  
   Non-interactive mode. Assume “yes” to prompts where applicable.
 

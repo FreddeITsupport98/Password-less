@@ -15,7 +15,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--all-groups]
 
 Options:
   --user USER               Target USER (default: the invoking user running the script)
@@ -25,6 +25,7 @@ Options:
   --force                   Overwrite existing /etc/sudoers.d and polkit rule files for this user (backs up first)
   --dry-run                 Print what would change, but do not write files
   --full-file-permissions   Give TARGET_USER recursive rwx ACLs on the root filesystem (/); extremely dangerous
+  --all-groups              Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   -h, --help                Show this help
 
 Notes:
@@ -47,6 +48,7 @@ restore_mode=0
 verify_only=0
 relax_mac=0
 full_file_permissions=0
+all_groups=0
 TARGET_USER=""
 POLKIT_TMP=""
 
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --full-file-permissions)
       full_file_permissions=1
+      shift
+      ;;
+    --all-groups)
+      all_groups=1
       shift
       ;;
     --yes)
@@ -567,27 +573,53 @@ require_sudo
 if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
   install_deps_if_missing
 
-  # Ensure the target user is a member of requested privileged groups.
-  # Includes classic admin groups and device/journal/network access groups.
-  for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem adm; do
-    # Only attempt to add the user if the group actually exists on this system.
-    if ! getent group "$grp" >/dev/null 2>&1; then
-      log "[info] Group $grp does not exist on this system; skipping."
-      continue
+  if [[ "$all_groups" -eq 1 ]]; then
+    warn "[groups] You requested to add $TARGET_USER to **every** group on this system (getent group). This effectively removes nearly all group-based security boundaries."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would enumerate groups via: getent group | cut -d: -f1"
     fi
 
-    log "[info] Ensuring $TARGET_USER is in $grp group..."
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would run: sudo usermod -aG $grp $TARGET_USER"
-    else
-      if id -nG "$TARGET_USER" | grep -qw "$grp"; then
-        log "[info] $TARGET_USER is already in $grp group; skipping usermod."
-      else
-        sudo usermod -aG "$grp" "$TARGET_USER"
-        log "[info] Added $TARGET_USER to $grp group. You may need to log out and back in for this to take effect."
+    # Enumerate all groups from the system database.
+    while IFS=: read -r grp_name _; do
+      [[ -z "$grp_name" ]] && continue
+
+      # Skip if user is already a member.
+      if id -nG "$TARGET_USER" | grep -qw "$grp_name"; then
+        log "[info] $TARGET_USER is already in $grp_name group; skipping."
+        continue
       fi
-    fi
-  done
+
+      log "[info] Ensuring $TARGET_USER is in $grp_name group (all-groups mode)..."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: sudo usermod -aG $grp_name $TARGET_USER"
+      else
+        sudo usermod -aG "$grp_name" "$TARGET_USER"
+        log "[info] Added $TARGET_USER to $grp_name group. You may need to log out and back in for this to take effect."
+      fi
+    done < <(getent group)
+  else
+    # Ensure the target user is a member of requested privileged groups.
+    # Includes classic admin groups and device/journal/network access groups.
+    for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem adm; do
+      # Only attempt to add the user if the group actually exists on this system.
+      if ! getent group "$grp" >/dev/null 2>&1; then
+        log "[info] Group $grp does not exist on this system; skipping."
+        continue
+      fi
+
+      log "[info] Ensuring $TARGET_USER is in $grp group..."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: sudo usermod -aG $grp $TARGET_USER"
+      else
+        if id -nG "$TARGET_USER" | grep -qw "$grp"; then
+          log "[info] $TARGET_USER is already in $grp group; skipping usermod."
+        else
+          sudo usermod -aG "$grp" "$TARGET_USER"
+          log "[info] Added $TARGET_USER to $grp group. You may need to log out and back in for this to take effect."
+        fi
+      fi
+    done
+  fi
 fi
 
 # Optionally relax MAC (AppArmor/SELinux) controls or report their status.
