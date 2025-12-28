@@ -13,6 +13,8 @@ This repository provides:
 
 ## ⚠️ Security Warnings & Disclaimer
 
+**You must read this entire README (including all warnings and option descriptions) before running `setup-passwordless-fb.sh`. If you choose to run the script without fully understanding this document, you accept that any damage, data loss, or security compromise is entirely your responsibility.**
+
 This script gives the target user essentially **root-equivalent power without any password prompt** and may also add them to highly privileged system groups (such as `root`, `disk`, `shadow`, and `kmem`).
 
 - The target user can run **any command** as root with `sudo` without being asked for a password.
@@ -24,6 +26,27 @@ This script gives the target user essentially **root-equivalent power without an
 - **Full system compromise** is possible if this user account is ever abused or compromised.
 - Local malware running as that user can trivially escalate to **full root**.
 - Traditional protections such as `sudo` password prompts and some polkit dialogs will no longer provide meaningful defense.
+
+### High‑risk behaviors and options (read this first)
+
+In addition to configuring passwordless sudo and (optionally) polkit, this script can:
+
+- Add the target user to **highly privileged system groups** such as `root`, `disk`, `shadow`, `kmem`, and `wheel`.  
+  This can give the user **direct access to raw disks, password hashes, kernel interfaces and system configuration**, even **without** using `sudo`.
+- Optionally **relax mandatory access controls (MAC)** when `--relax-mac` is used, by stopping AppArmor (if present) and attempting to switch SELinux to **permissive** mode.  
+  This removes an important layer of defense on top of normal Unix permissions and sudo.
+- Optionally configure polkit so that the user receives **automatic approval for all polkit actions** (no graphical confirmation dialogs).
+- Optionally (with `--full-file-permissions`) run a recursive ACL change equivalent to:
+
+  ```bash
+  sudo setfacl -R -m u:<TARGET_USER>:rwx /
+  ```
+
+  This grants the target user **read/write/execute** permissions on almost everything under `/` that supports ACLs.  
+  In practice this is a **filesystem-wide superuser** grant that is **more invasive and harder to undo than passwordless sudo itself**.
+
+These options are **off by default**, but if you enable them you should assume that the machine is effectively **permanently and irreversibly weakened** from a security standpoint.  
+Do **not** enable them on any machine where you care about multi‑user isolation, strong security boundaries, or reliable long‑term integrity.
 
 ### Recommended extra precautions
 
