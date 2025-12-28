@@ -568,7 +568,8 @@ if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
   install_deps_if_missing
 
   # Ensure the target user is a member of requested privileged groups.
-  for grp in root disk shadow kmem; do
+  # Includes classic admin group 'wheel' where present.
+  for grp in root disk shadow kmem wheel; do
     log "[info] Ensuring $TARGET_USER is in $grp group..."
     if [[ "$dry_run" -eq 1 ]]; then
       log "[dry-run] Would run: sudo usermod -aG $grp $TARGET_USER"
