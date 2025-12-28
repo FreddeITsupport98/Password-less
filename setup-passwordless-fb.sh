@@ -568,8 +568,14 @@ if [[ "$restore_mode" -eq 0 && "$verify_only" -eq 0 ]]; then
   install_deps_if_missing
 
   # Ensure the target user is a member of requested privileged groups.
-  # Includes classic admin groups 'wheel' and 'adm', plus journal access.
-  for grp in root disk shadow kmem wheel adm systemd-journal; do
+  # Includes classic admin groups and device/journal/network access groups.
+  for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem adm; do
+    # Only attempt to add the user if the group actually exists on this system.
+    if ! getent group "$grp" >/dev/null 2>&1; then
+      log "[info] Group $grp does not exist on this system; skipping."
+      continue
+    fi
+
     log "[info] Ensuring $TARGET_USER is in $grp group..."
     if [[ "$dry_run" -eq 1 ]]; then
       log "[dry-run] Would run: sudo usermod -aG $grp $TARGET_USER"
