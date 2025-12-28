@@ -179,6 +179,42 @@ Basic usage:
   This effectively removes almost all group-based isolation between the user and system services, daemons, and device nodes.  
   Use this only if you fully understand that it turns the user into a "member of everything" and are prepared to reinstall the system if something breaks.
 
+#### Why `--all-groups` is especially dangerous
+
+Adding the `--all-groups` flag to add your user to every group on the system is a classic case of **confused security boundaries**: it looks like a shortcut to "ultimate power", but it actually breaks how Linux separates services from users.
+
+1. **You become the "victim" for service accounts**  
+   Many daemons run under special accounts and groups (e.g. `www-data`, `nginx`, `mail`, `dbus`, `rpc`, etc.).  
+   - If you join a web-server-related group and accidentally store files with group-write or group-read permissions, the web server may now be able to read or modify them.  
+   - If that service is compromised, the attacker can pivot directly into your data, because you **bridged the gap** between a confined service and your personal files via group membership.
+
+2. **The "nobody" / "nogroup" paradox**  
+   Groups like `nobody` / `nogroup` are designed as **least-privilege sinks**. Some security checks treat them specially.  
+   - Joining such groups can interact badly with mechanisms that expect only unprivileged, throwaway processes to be in them.  
+   - You risk tripping logic that was never written with "a real interactive user in this group" in mind.
+
+3. **Fighting the seat manager (audio/video and device groups)**  
+   Modern Linux desktops use seat management (e.g. `systemd-logind`) to grant access to hardware devices (audio, video, input, GPUs, TTYs) dynamically to the **currently active session**.  
+   - Hard-coding yourself into groups like `audio`, `video`, `render`, `kvm`, `tty`, `disk`, `tape`, etc. can confuse or override these mechanisms.  
+   - This can lead to strange bugs such as other users on the same machine losing sound, display, or device access because your account "owns" those devices via group membership all the time.
+
+4. **Unintended privilege-escalation backdoors**  
+   Some groups are effectively **root aliases**:
+   - `docker`, `lxd`, `libvirt` – can start privileged containers/VMs and break out; effectively root.
+   - `shadow` – read access to password hashes.
+   - `disk` – raw block device access (bypassing filesystem permissions entirely).
+   - `kmem` – direct access to kernel memory on some systems.  
+   By joining **every** group, you enable **all** of these escalation paths at once, plus many more subtle ones. This creates a permissions landscape that is extremely hard to audit or revert cleanly.
+
+**Summary:**  
+`--all-groups` is imprecise and noisy:
+
+- It adds you to **dangerous groups** (which already gives you "root-alike" power).
+- It also adds you to **service groups** (which weakens isolation without useful extra power).
+- It pulls you into **legacy/system groups** where your presence may surprise or confuse both the OS and security tooling.
+
+For most scenarios, a curated set of "supreme" groups (e.g. `root`, `disk`, `wheel`, `systemd-journal`, `network`, `video`, `audio`, `input`, `render`, `kvm`, `tty`, `tape`, `shadow`, `kmem`, `adm`) already yields near-total control while being somewhat more predictable and documented than `--all-groups`.
+
 - `--yes`  
   Non-interactive mode. Assume “yes” to prompts where applicable.
 
