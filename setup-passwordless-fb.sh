@@ -15,16 +15,17 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions]
 
 Options:
-  --user USER     Target USER (default: the invoking user running the script)
-  --sudo-only     Only configure passwordless sudo (skip polkit)
-  --no-install    Do not attempt to install missing dependencies
-  --yes           Non-interactive: assume "yes" to prompts
-  --force         Overwrite existing /etc/sudoers.d and polkit rule files for this user (backs up first)
-  --dry-run       Print what would change, but do not write files
-  -h, --help      Show this help
+  --user USER               Target USER (default: the invoking user running the script)
+  --sudo-only               Only configure passwordless sudo (skip polkit)
+  --no-install              Do not attempt to install missing dependencies
+  --yes                     Non-interactive: assume "yes" to prompts
+  --force                   Overwrite existing /etc/sudoers.d and polkit rule files for this user (backs up first)
+  --dry-run                 Print what would change, but do not write files
+  --full-file-permissions   Give TARGET_USER recursive rwx ACLs on the root filesystem (/); extremely dangerous
+  -h, --help                Show this help
 
 Notes:
   - Run as a normal user with sudo access (do NOT run as root).
@@ -45,6 +46,7 @@ no_install=0
 restore_mode=0
 verify_only=0
 relax_mac=0
+full_file_permissions=0
 TARGET_USER=""
 POLKIT_TMP=""
 
@@ -75,6 +77,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verify-only|--verify)
       verify_only=1
+      shift
+      ;;
+    --full-file-permissions)
+      full_file_permissions=1
       shift
       ;;
     --yes)
@@ -487,6 +493,31 @@ relax_mac_controls_if_requested() {
   warn "MAC relaxation (if any) was applied at runtime only. Persistent boot-time settings were NOT modified."
 }
 
+configure_full_file_permissions() {
+  # Give TARGET_USER recursive rwx ACLs on the root filesystem (/).
+  # This is equivalent in practice to full system compromise for that user.
+  # The user requested this behavior; we guard it behind an explicit flag and
+  # an extra confirmation prompt.
+  warn "You requested to grant '$TARGET_USER' full rwx ACLs on /.".
+  warn "This will run: sudo setfacl -R -m u:$TARGET_USER:rwx /"
+  warn "This is extremely dangerous and may irreversibly change permissions across the system."
+
+  if ! have_cmd setfacl; then
+    die "setfacl command not found; cannot apply full file permissions. Install acl utilities and re-run."
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would run: sudo setfacl -R -m u:$TARGET_USER:rwx /"
+    return 0
+  fi
+
+  if ! confirm "Really apply recursive ACL 'u:$TARGET_USER:rwx' to / ?"; then
+    die "Aborted full-file-permissions at your request."
+  fi
+
+  sudo setfacl -R -m "u:$TARGET_USER:rwx" /
+}
+
 configure_kdesu_for_sudo() {
   # On KDE, configure the graphical "Run as root" helper (kdesu) to use sudo
   # instead of su, so it respects the passwordless sudo we just set up.
@@ -737,6 +768,11 @@ fi
 
 # KDE integration: make the GUI "Run as root" helper use sudo instead of su.
 configure_kdesu_for_sudo
+
+if [[ "$full_file_permissions" -eq 1 ]]; then
+  log "[extra] Applying full-file-permissions ACLs for $TARGET_USER on /..."
+  configure_full_file_permissions
+fi
 
 log "Done."
 log "To undo: remove $SUDOERS_DEST and $POLKIT_RULE_PATH (and any .bak.* backups you created)."
