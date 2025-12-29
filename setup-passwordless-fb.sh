@@ -1129,4 +1129,5 @@ if [[ "$full_file_permissions" -eq 1 ]]; then
 fi
 
 log "Done."
+log "[info] Some changes (group membership, PAM, polkit, ACLs) may only fully take effect after you log out and back in, or reboot the system."
 log "To undo: remove $SUDOERS_DEST, $POLKIT_RULE_PATH, and revert any changes to /etc/pam.d/su using the .bak.* backups created by this script (if present)."
