@@ -160,7 +160,7 @@ chmod +x setup-passwordless-fb.sh
 Basic usage:
 
 ```bash
-./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run]
+./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--delete-passwd-on-polkit-fail]
 ```
 
 ### Options
@@ -193,6 +193,15 @@ Basic usage:
   **Extremely dangerous**: enumerate **every group** on the system via `getent group` and add the target user to all of them (except those they are already a member of).  
   This effectively removes almost all group-based isolation between the user and system services, daemons, and device nodes.  
   Use this only if you fully understand that it turns the user into a "member of everything" and are prepared to reinstall the system if something breaks.
+
+- `--delete-passwd-on-polkit-fail`  
+  **Dangerous, optional**: when the script detects a newer polkit (for example, `polkit-1 124+`) and cannot find any existing JS `.rules` files that use `polkit.addRule` (meaning JS rules may no longer be honored), this flag allows the script to *offer* to delete the local Unix password for the target user via:
+  
+  ```bash
+  sudo passwd -d <TARGET_USER>
+  ```
+  
+  This can help keep desktop/GUI auth flows effectively passwordless even when polkit JS rules are disabled, but it also removes the traditional Unix password from that account. The script will still ask for explicit confirmation before running `passwd -d`, and respects `--dry-run`.
 
 #### Why `--all-groups` is especially dangerous
 
@@ -375,7 +384,9 @@ This means you can re-run the script multiple times and **it won’t keep append
 
 ### 6. (Optional) Configure Polkit Rule
 
-Unless `--sudo-only` is passed, the script attempts to create a polkit rule which grants the target user unconditional approval:
+Unless `--sudo-only` is passed, the script attempts to create a polkit rule which grants the target user unconditional approval. It also includes **tightened detection** for newer polkit versions where JavaScript rules may no longer be honored.
+
+#### 6.1 Creating the rule
 
 - Writes `/etc/polkit-1/rules.d/00-allow-<user>-everything.rules` similar to:
 
@@ -393,6 +404,19 @@ Unless `--sudo-only` is passed, the script attempts to create a polkit rule whic
 - Checks if the existing rule (if any) is identical; if so, it does not overwrite.
 - Otherwise, backs up the old one (if `--force` is used) and installs the new rule.
 - Attempts to restart polkit (best effort), using either `systemctl` or `service`.
+
+#### 6.2 Detecting when JS rules may be unsupported
+
+Before writing or relying on the JS rule, the script:
+
+- Uses `pkaction --version` to detect polkit versions **124+** (where upstream dropped JS rules).
+- If a newer polkit is detected, it searches common rules directories such as:
+  - `/etc/polkit-1/rules.d`
+  - `/usr/share/polkit-1/rules.d`
+  - `/usr/lib/polkit-1/rules.d`
+
+  for `.rules` files that contain `polkit.addRule`. If any are found, it assumes JS rules are still supported by the distro.
+- If **no** such JS rules are found, it marks JS rules as "maybe unsupported" and logs a warning. At that point, if you used `--delete-passwd-on-polkit-fail`, the script can optionally offer to delete the local Unix password for the target user with `passwd -d`, to keep GUI auth flows effectively passwordless even when polkit rules are ignored.
 
 ### 7. Polkit Sanity Check (Best Effort)
 

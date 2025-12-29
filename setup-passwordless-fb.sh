@@ -15,18 +15,19 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--all-groups]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--all-groups] [--delete-passwd-on-polkit-fail]
 
 Options:
-  --user USER               Target USER (default: the invoking user running the script)
-  --sudo-only               Only configure passwordless sudo (skip polkit)
-  --no-install              Do not attempt to install missing dependencies
-  --yes                     Non-interactive: assume "yes" to prompts
-  --force                   Overwrite existing /etc/sudoers.d and polkit rule files for this user (backs up first)
-  --dry-run                 Print what would change, but do not write files
-  --full-file-permissions   Give TARGET_USER recursive rwx ACLs on the root filesystem (/); extremely dangerous
-  --all-groups              Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
-  -h, --help                Show this help
+  --user USER                         Target USER (default: the invoking user running the script)
+  --sudo-only                         Only configure passwordless sudo (skip polkit)
+  --no-install                        Do not attempt to install missing dependencies
+  --yes                               Non-interactive: assume "yes" to prompts
+  --force                             Overwrite existing /etc/sudoers.d and polkit rule files for this user (backs up first)
+  --dry-run                           Print what would change, but do not write files
+  --full-file-permissions             Give TARGET_USER recursive rwx ACLs on the root filesystem (/); extremely dangerous
+  --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
+  --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
+  -h, --help                          Show this help
 
 Notes:
   - Run as a normal user with sudo access (do NOT run as root).
@@ -49,6 +50,8 @@ verify_only=0
 relax_mac=0
 full_file_permissions=0
 all_groups=0
+delete_passwd_on_polkit_fail=0
+polkit_js_maybe_unsupported=0
 TARGET_USER=""
 POLKIT_TMP=""
 
@@ -87,6 +90,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all-groups)
       all_groups=1
+      shift
+      ;;
+    --delete-passwd-on-polkit-fail)
+      delete_passwd_on_polkit_fail=1
       shift
       ;;
     --yes)
@@ -384,6 +391,43 @@ js_escape_string() {
   printf '%s' "$s"
 }
 
+detect_polkit_js_support() {
+  # Best-effort detection of whether polkit JavaScript rules are likely supported.
+  # We primarily care about polkit >= 124, where upstream removed JS rules.
+  #
+  # Heuristics:
+  # - If pkaction is missing, we can't determine the version -> assume JS may be OK.
+  # - If pkaction reports polkit-1 < 124 -> assume JS rules are supported.
+  # - If pkaction reports polkit-1 >= 124:
+  #   - If we find any existing *.rules files that contain "polkit.addRule" under
+  #     common rules directories, assume JS is still supported by the distro.
+  #   - Otherwise, mark polkit_js_maybe_unsupported=1.
+  polkit_js_maybe_unsupported=0
+
+  if ! have_cmd pkaction; then
+    return 0
+  fi
+
+  local ver
+  ver="$(pkaction --version 2>/dev/null || true)"
+  if printf '%s\n' "$ver" | grep -Eiq 'polkit(\\s+|-)1(2[4-9]|[3-9][0-9])'; then
+    # Newer polkit; check for evidence of JS rules being used.
+    local js_rule_dir
+    for js_rule_dir in /etc/polkit-1/rules.d /usr/share/polkit-1/rules.d /usr/lib/polkit-1/rules.d; do
+      if [[ -d "$js_rule_dir" ]]; then
+        if grep -Rqs 'polkit.addRule' "$js_rule_dir" 2>/dev/null; then
+          # Existing JS rules found; assume JS is still supported.
+          return 0
+        fi
+      fi
+    done
+
+    # No JS rules detected in common locations; treat JS rules as maybe unsupported.
+    polkit_js_maybe_unsupported=1
+    warn "Your polkit appears to be >= 124 and no existing JS rules were found; JavaScript rules may be disabled/unsupported. Continuing anyway."
+  fi
+}
+
 restart_polkit_best_effort() {
   # systemd is common but not universal.
   if have_cmd systemctl; then
@@ -474,12 +518,8 @@ configure_polkit_for_user_js() {
   # Fallback/generic method: install a JS rule in /etc/polkit-1/rules.d.
   # This is used on non-SUSE systems and on SUSE if polkit-default-privs
   # tooling is not available.
-  # Detect polkit version if possible; warn if JS rules are likely unsupported.
-  if have_cmd pkaction; then
-    if pkaction --version 2>/dev/null | grep -Eiq 'polkit(\s+|-)1(2[4-9]|[3-9][0-9])'; then
-      warn "Your polkit appears to be >= 124; JavaScript rules may be disabled/unsupported. Continuing anyway."
-    fi
-  fi
+  # Detect polkit JS support and set polkit_js_maybe_unsupported accordingly.
+  detect_polkit_js_support
 
   POLKIT_RULE_DIR="/etc/polkit-1/rules.d"
   POLKIT_RULE_PATH="${POLKIT_RULE_DIR}/00-allow-${TARGET_USER}-everything.rules"
@@ -539,6 +579,40 @@ EOF
   fi
 
   return 0
+}
+
+maybe_delete_password_for_target_user() {
+  # Optionally delete the local Unix password for TARGET_USER via `passwd -d`
+  # when polkit JS rules appear unsupported (e.g. polkit >= 124).
+  # This is guarded behind the --delete-passwd-on-polkit-fail flag and an
+  # additional confirmation prompt.
+  if [[ "$delete_passwd_on_polkit_fail" -ne 1 ]]; then
+    return 0
+  fi
+
+  if [[ "$polkit_js_maybe_unsupported" -ne 1 ]]; then
+    # Nothing to do; polkit JS rules appear to be in normal mode.
+    return 0
+  fi
+
+  warn "Polkit appears to be using a newer JS engine (e.g. polkit >= 124) where JS rules may not be honored."
+  warn "You enabled --delete-passwd-on-polkit-fail, which allows this script to delete the local password for '$TARGET_USER' to keep GUI auth flows effectively passwordless."
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would run: sudo passwd -d $TARGET_USER"
+    return 0
+  fi
+
+  if ! confirm "Delete the local password for '$TARGET_USER' by running 'sudo passwd -d $TARGET_USER'?"; then
+    log "[info] Skipping password deletion for $TARGET_USER."
+    return 0
+  fi
+
+  if ! sudo passwd -d "$TARGET_USER"; then
+    warn "[polkit] Failed to delete password for $TARGET_USER via passwd -d."
+  else
+    log "[polkit] Deleted local password for $TARGET_USER via passwd -d (account now has no Unix password)."
+  fi
 }
 
 relax_mac_controls_if_requested() {
@@ -1031,6 +1105,10 @@ if is_suse_like && have_suse_polkit_defaults; then
 else
   configure_polkit_for_user_js || true
 fi
+
+# If requested and polkit JS rules look unsupported, optionally delete the
+# local password for TARGET_USER to keep GUI auth effectively passwordless.
+maybe_delete_password_for_target_user
 
 # KDE integration: make the GUI "Run as root" helper use sudo instead of su.
 configure_kdesu_for_sudo
