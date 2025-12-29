@@ -94,7 +94,7 @@ Before using this script, **read and understand** all of the following:
 ### Legal / warranty disclaimer
 
 - This script and documentation are provided **“as is”**, **without any warranty** of any kind, express or implied.  
-- **I am not the original author of this script** and make **no guarantees** about its safety, correctness, fitness for a particular purpose, or suitability for your environment.  
+- **I am the original author of this script** and make **no guarantees** about its safety, correctness, fitness for a particular purpose, or suitability for your environment.  
 - You are solely responsible for **reviewing the code**, understanding what it does, and deciding whether it is appropriate to run on your systems.  
 - By using this script, **you accept all risk**, including but not limited to data loss, security breaches, service outages, and legal or policy violations.
 
