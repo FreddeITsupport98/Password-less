@@ -586,17 +586,23 @@ maybe_delete_password_for_target_user() {
   # when polkit JS rules appear unsupported (e.g. polkit >= 124).
   # This is guarded behind the --delete-passwd-on-polkit-fail flag and an
   # additional confirmation prompt.
-  if [[ "$delete_passwd_on_polkit_fail" -ne 1 ]]; then
-    return 0
-  fi
 
+  # If polkit looks normal, nothing to do.
   if [[ "$polkit_js_maybe_unsupported" -ne 1 ]]; then
-    # Nothing to do; polkit JS rules appear to be in normal mode.
     return 0
   fi
 
+  # Always inform the user when we think JS rules may not be honored.
   warn "Polkit appears to be using a newer JS engine (e.g. polkit >= 124) where JS rules may not be honored."
-  warn "You enabled --delete-passwd-on-polkit-fail, which allows this script to delete the local password for '$TARGET_USER' to keep GUI auth flows effectively passwordless."
+
+  # If the flag was *not* provided, just warn and suggest what to do, but
+  # do not change any passwords automatically.
+  if [[ "$delete_passwd_on_polkit_fail" -ne 1 ]]; then
+    warn "You did NOT pass --delete-passwd-on-polkit-fail. If you also want to drop the local Unix password for '$TARGET_USER' to keep GUI auth flows passwordless, re-run this script with that flag enabled (see README for details), or adjust the password manually. This is **dangerous** and can lock you out if you do not have another way to log in (e.g. SSH keys, another admin user, or root console). Use at your own risk."
+    return 0
+  fi
+
+  warn "You enabled --delete-passwd-on-polkit-fail, which allows this script to delete the local password for '$TARGET_USER' to keep GUI auth flows effectively passwordless. This is **dangerous** and may lock you out of local logins if you rely on a Unix password for this account. Proceed only if you fully understand the consequences."
 
   if [[ "$dry_run" -eq 1 ]]; then
     log "[dry-run] Would run: sudo passwd -d $TARGET_USER"
