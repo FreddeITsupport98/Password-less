@@ -2,14 +2,29 @@
 
 Opinionated, **idempotent** helper script to enable passwordless `sudo` (and optionally polkit) for a single user on Linux.
 
+## Why passwordless sudo / su and what this script is for
+
+This script exists for a very specific use case: a **single-user, personal or lab machine** where convenience matters more than strict isolation.
+
+- I wanted a way to log into my normal account and have **full admin power immediately**, without constantly typing my password for every `sudo` or `su`.
+- I also wanted this to be **repeatable and transparent**: instead of hand-editing `/etc/sudoers` or PAM files by trial and error on every new install, I can run one well-documented script.
+- The script is designed to be **idempotent and self-checking**: it validates syntax with `visudo`, makes backups when overwriting, and avoids adding duplicate lines, so I can safely re-run it on my own systems.
+
+Because of that, this project is **not** meant for multi-user servers, shared machines, or security-sensitive environments. It is explicitly an automation of "make this one user effectively root with no password prompts" for people (like me) who:
+
+- Are comfortable accepting that **any compromise of that user account is a full system compromise**.
+- Prefer fast, passwordless admin workflows on their own machines.
+- Want the configuration to be auditable and reproducible instead of a pile of manual tweaks.
+
 This repository provides:
 
 - `setup-passwordless-fb.sh` – a robust helper script that:
   - Configures **passwordless sudo** for a single user via `/etc/sudoers.d/…`
   - Optionally also configures **polkit** to always approve actions for that user
   - Can also ensure `/etc/sudoers` itself contains a `NOPASSWD` entry for the user
+  - (Best-effort) adjusts the **PAM `su` service** so that members of the `wheel` group can use `su` **without a password** on PAM-based Linux distros where a `su`/`su-l` service exists
   - Is **safe** by design: uses `visudo` for syntax validation and makes backups before replacing system files
-  - Is **idempotent**: re-running the script does **not** keep appending duplicate lines
+  - Is **idempotent**: re-running the script does **not** keep appending duplicate lines or duplicating PAM `pam_wheel.so` entries
 
 ## ⚠️ Security Warnings & Disclaimer
 
@@ -214,6 +229,15 @@ Adding the `--all-groups` flag to add your user to every group on the system is 
 - It pulls you into **legacy/system groups** where your presence may surprise or confuse both the OS and security tooling.
 
 For most scenarios, a curated set of "supreme" groups (e.g. `root`, `disk`, `wheel`, `systemd-journal`, `network`, `video`, `audio`, `input`, `render`, `kvm`, `tty`, `tape`, `shadow`, `kmem`, `adm`) already yields near-total control while being somewhat more predictable and documented than `--all-groups`.
+
+In addition, the script will (where a `su` PAM service is present – either directly in `/etc/pam.d/su` or `/etc/pam.d/su-l`, or via a vendor file in `/usr/lib/pam.d` that it copies into `/etc/pam.d`) adjust the PAM configuration so that users in the `wheel` group can run `su` **without a password** by adding the `trust` option to the `pam_wheel.so` line. This logic is designed to be **idempotent and cross‑distro friendly**:
+
+- It first looks for an existing `pam_wheel.so` line and, if present, only adds `trust` (without duplicating the line).
+- If no `pam_wheel.so` line exists, it inserts a single `auth     sufficient   pam_wheel.so use_uid trust group=wheel` line in a sensible place (typically after the `pam_rootok.so` auth line, or near the top of the file as a fallback).
+- It only touches PAM configs when a `su`/`su-l` service file exists (either in `/etc/pam.d` or as a vendor file under `/usr/lib/pam.d`).
+
+This makes `su` effectively passwordless for your admin user, on top of passwordless `sudo`, on most PAM-based Linux distributions where a `wheel` group is present.  
+**Important:** this PAM change does **not** create or modify groups; it only changes how `su` authenticates users who are already members of `wheel`. On systems where `wheel` does not exist or is not used for admin access, you may need to adjust the PAM `group=` setting or create/assign the `wheel` group yourself.
 
 - `--yes`  
   Non-interactive mode. Assume “yes” to prompts where applicable.

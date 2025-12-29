@@ -693,6 +693,141 @@ configure_kdesu_for_sudo() {
   fi
 }
 
+configure_pam_su_passwordless_for_wheel() {
+  # Make 'su' passwordless for users in the 'wheel' group by adding 'trust'
+  # to the pam_wheel.so line in the su PAM service config.
+  # On some distros (e.g. openSUSE), the shipped config lives in /usr/lib/pam.d
+  # and /etc/pam.d may not contain a service-specific file until overridden.
+  local pam_su=""
+  local tmp
+  local inserted_new_line=0
+
+  if sudo test -e /etc/pam.d/su; then
+    pam_su="/etc/pam.d/su"
+  elif sudo test -e /etc/pam.d/su-l; then
+    pam_su="/etc/pam.d/su-l"
+  elif sudo test -e /usr/lib/pam.d/su; then
+    # Copy vendor su config into /etc so we can apply a local override safely.
+    pam_su="/etc/pam.d/su"
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would copy /usr/lib/pam.d/su to /etc/pam.d/su as a local override before modifying."
+    else
+      sudo mkdir -p /etc/pam.d
+      sudo cp /usr/lib/pam.d/su "$pam_su"
+      log "[info] Created local PAM su config at $pam_su from /usr/lib/pam.d/su."
+    fi
+  elif sudo test -e /usr/lib/pam.d/su-l; then
+    pam_su="/etc/pam.d/su-l"
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would copy /usr/lib/pam.d/su-l to /etc/pam.d/su-l as a local override before modifying."
+    else
+      sudo mkdir -p /etc/pam.d
+      sudo cp /usr/lib/pam.d/su-l "$pam_su"
+      log "[info] Created local PAM su-l config at $pam_su from /usr/lib/pam.d/su-l."
+    fi
+  else
+    log "[info] PAM su config not found in /etc/pam.d or /usr/lib/pam.d; skipping su passwordless tweak."
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  if ! sudo cp "$pam_su" "$tmp"; then
+    rm -f "$tmp"
+    warn "[pam-su] Could not copy $pam_su; skipping PAM modification."
+    return 0
+  fi
+
+  # If a pam_wheel line with 'trust' already exists, do nothing.
+  if sudo grep -Eq 'pam_wheel\\.so.*trust' "$tmp"; then
+    log "[info] PAM su already has pam_wheel.so with trust; leaving as-is."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # If there's no pam_wheel line at all, inject a pam_wheel.so trust line
+  # either after pam_rootok.so (preferred) or near the top of the file as a
+  # fallback, restricted to the wheel group.
+  if ! sudo grep -Eq 'pam_wheel\\.so' "$tmp"; then
+    if sudo grep -Eq '^auth.*pam_rootok\\.so' "$tmp"; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would insert: 'auth     sufficient   pam_wheel.so use_uid trust group=wheel' after pam_rootok.so in $pam_su."
+        rm -f "$tmp"
+        return 0
+      fi
+      # Build a new file with the injected pam_wheel line after pam_rootok.so.
+      local injected
+      injected="$(mktemp)"
+      sudo awk '
+        BEGIN { added=0 }
+        /^auth[[:space:]]+sufficient[[:space:]]+pam_rootok\.so/ {
+          print $0
+          if (!added) {
+            print "auth     sufficient   pam_wheel.so use_uid trust group=wheel"
+            added=1
+          }
+          next
+        }
+        { print $0 }
+      ' "$tmp" > "$injected" || { rm -f "$tmp" "$injected"; warn "[pam-su] awk injection into $pam_su failed; not installing changed file."; return 0; }
+      sudo mv "$injected" "$tmp"
+      inserted_new_line=1
+      log "[info] Inserted pam_wheel.so use_uid trust group=wheel into $pam_su for passwordless su via wheel."
+    else
+      # Fallback: insert the pam_wheel line near the top of the file (after the
+      # header or first auth line) so that wheel users still get passwordless su
+      # even if pam_rootok.so is not present.
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would insert pam_wheel.so use_uid trust group=wheel into $pam_su (no pam_rootok.so line detected)."
+        rm -f "$tmp"
+        return 0
+      fi
+      local injected
+      injected="$(mktemp)"
+      sudo awk '
+        BEGIN { added=0 }
+        NR==1 && /^#%PAM-1\.0/ {
+          print $0
+          if (!added) {
+            print "auth     sufficient   pam_wheel.so use_uid trust group=wheel"
+            added=1
+          }
+          next
+        }
+        /^auth[[:space:]]/ && !added {
+          print "auth     sufficient   pam_wheel.so use_uid trust group=wheel"
+          added=1
+        }
+        { print $0 }
+      ' "$tmp" > "$injected" || { rm -f "$tmp" "$injected"; warn "[pam-su] awk fallback injection into $pam_su failed; not installing changed file."; return 0; }
+      sudo mv "$injected" "$tmp"
+      inserted_new_line=1
+      log "[info] Inserted pam_wheel.so use_uid trust group=wheel into $pam_su (fallback path) for passwordless su via wheel."
+    fi
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would modify $pam_su to add 'trust' to pam_wheel.so so that users in wheel can run su without a password."
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # Add 'trust' to any existing pam_wheel.so line that has 'use_uid' but no
+  # 'trust', but skip this if we just injected a fully-formed line ourselves.
+  if [[ "$inserted_new_line" -eq 0 ]]; then
+    if ! sudo sed -Ei 's/(pam_wheel\\.so[^#]*use_uid)([^#]*)(#.*)?/\1 trust\2\3/' "$tmp"; then
+      rm -f "$tmp"
+      warn "[pam-su] sed modification of $pam_su failed; not installing changed file."
+      return 0
+    fi
+  fi
+
+  backup_if_exists "$pam_su"
+  sudo install -o root -g root -m 0644 "$tmp" "$pam_su"
+  rm -f "$tmp"
+
+  log "[info] Updated $pam_su to allow passwordless su for users in the wheel group."
+}
+
 # --- Sanity checks ---
 if [[ "$(id -u)" -eq 0 ]]; then
   die "Do not run as root. Run as the target user with sudo access."
@@ -900,10 +1035,14 @@ fi
 # KDE integration: make the GUI "Run as root" helper use sudo instead of su.
 configure_kdesu_for_sudo
 
+# PAM integration: make 'su' passwordless for users in the 'wheel' group.
+log "[info] Adjusting PAM su configuration (if compatible) to allow passwordless su for wheel users..."
+configure_pam_su_passwordless_for_wheel
+
 if [[ "$full_file_permissions" -eq 1 ]]; then
   log "[extra] Applying full-file-permissions ACLs for $TARGET_USER on /..."
   configure_full_file_permissions
 fi
 
 log "Done."
-log "To undo: remove $SUDOERS_DEST and $POLKIT_RULE_PATH (and any .bak.* backups you created)."
+log "To undo: remove $SUDOERS_DEST, $POLKIT_RULE_PATH, and revert any changes to /etc/pam.d/su using the .bak.* backups created by this script (if present)."
