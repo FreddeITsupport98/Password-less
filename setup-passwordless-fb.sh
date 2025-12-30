@@ -425,6 +425,7 @@ detect_polkit_js_support() {
     # No JS rules detected in common locations; treat JS rules as maybe unsupported.
     polkit_js_maybe_unsupported=1
     warn "Your polkit appears to be >= 124 and no existing JS rules were found; JavaScript rules may be disabled/unsupported. Continuing anyway."
+    log "[info] polkit_js_maybe_unsupported=1 (version looks >= 124 and no JS polkit.addRule rules were found)."
   fi
 }
 
