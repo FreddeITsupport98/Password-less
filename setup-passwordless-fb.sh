@@ -1044,6 +1044,14 @@ EOF
   # shell expansion of ACL_TARGET_USER under set -u when generating the unit.
   local acl_target_for_unit
   acl_target_for_unit="${ACL_TARGET_USER:-$default_target}"
+
+  # We also bake ACL_EXTRA_ARGS directly into the unit at generation time
+  # instead of relying on shell expansion inside ExecStart. This avoids
+  # systemd warnings about unknown escape sequences and keeps the unit
+  # behavior predictable even if the env file is later edited.
+  local acl_extra_for_unit
+  acl_extra_for_unit="$ACL_EXTRA_ARGS"
+
   cat >"$tmp_srv" <<EOF
 [Unit]
 Description=Apply full-file-permissions ACLs for $acl_target_for_unit via setup-passwordless-fb.sh
@@ -1052,7 +1060,7 @@ After=local-fs.target
 [Service]
 Type=oneshot
 EnvironmentFile=-$env_path
-ExecStart=/usr/bin/env bash $script_path --user $acl_target_for_unit --full-file-permissions \\${ACL_EXTRA_ARGS}
+ExecStart=/usr/bin/env bash $script_path --user $acl_target_for_unit --full-file-permissions $acl_extra_for_unit
 EOF
   write_root_file "$tmp_srv" "$service_path" 0644
   rm -f "$tmp_srv"
