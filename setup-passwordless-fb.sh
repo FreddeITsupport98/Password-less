@@ -782,15 +782,16 @@ configure_full_file_permissions() {
     # fall back to an open-ended progress indicator.
     if [[ "$total_files" =~ ^[0-9]+$ && "$total_files" -gt 0 ]]; then
       log "[info] Found $total_files items. Starting ACL application with progress bar..."
-      # Use find with pv to show progress, piping to setfacl
-      find / -xdev -print0 2>/dev/null | pv -l -s "$total_files" | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
+      # Use find with pv to show progress, piping to setfacl. We use newline-delimited
+      # paths so that pv's -l counter matches the wc -l total above.
+      find / -xdev 2>/dev/null | pv -l -s "$total_files" | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
         acl_had_errors=1
       }
     else
       # Fallback if counting failed or produced an invalid value
       log "[info] Could not count files reliably. Using progress indicator without total..."
-      find / -xdev -print0 2>/dev/null | pv -l | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
+      find / -xdev 2>/dev/null | pv -l | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
         acl_had_errors=1
       }
@@ -975,7 +976,11 @@ configure_pam_su_passwordless_for_wheel() {
 
 # --- Sanity checks ---
 if [[ "$(id -u)" -eq 0 ]]; then
-  die "Do not run as root. Run as the target user with sudo access."
+  if [[ "$full_file_permissions" -eq 1 ]]; then
+    warn "Running as root with --full-file-permissions; proceeding with extreme caution."
+  else
+    die "Do not run as root. Run as the target user with sudo access (unless you are only using --full-file-permissions)."
+  fi
 fi
 
 # Default target user is the current invoking user.
