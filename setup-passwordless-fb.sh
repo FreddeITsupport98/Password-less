@@ -763,6 +763,11 @@ configure_full_file_permissions() {
   fi
 
   log "[info] Applying recursive ACLs... This may take a while. Press Ctrl+C to cancel."
+
+  # Track whether we saw any failures while applying ACLs. We always return 0
+  # from this function so that partial failures do not abort the entire
+  # passwordless configuration flow, but we still surface a warning.
+  local acl_had_errors=0
   
   # Check if pv is available for progress display
   if have_cmd pv; then
@@ -780,26 +785,33 @@ configure_full_file_permissions() {
       # Use find with pv to show progress, piping to setfacl
       find / -xdev -print0 2>/dev/null | pv -l -s "$total_files" | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
-        return 1
+        acl_had_errors=1
       }
     else
       # Fallback if counting failed or produced an invalid value
       log "[info] Could not count files reliably. Using progress indicator without total..."
       find / -xdev -print0 2>/dev/null | pv -l | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
-        return 1
+        acl_had_errors=1
       }
     fi
   else
     # No pv available, fall back to original command with spinner
     log "[info] 'pv' not found. Running without progress bar (install 'pv' for progress display)..."
     sudo setfacl -R -m "u:$TARGET_USER:rwx" / || {
-      warn "ACL application encountered errors or was interrupted."
-      return 1
+      warn "ACL application encountered errors or was interrupted. Some files may not have been processed."
+      acl_had_errors=1
     }
   fi
-  
-  log "[info] ACL application completed."
+
+  if [[ "$acl_had_errors" -eq 1 ]]; then
+    warn "Full-file-permissions ACLs completed with some errors; overall setup will continue. Review setfacl warnings above if you care about 100% coverage."
+  else
+    log "[info] ACL application completed."
+  fi
+
+  # Never fail the overall script solely because some ACL applications failed.
+  return 0
 }
 
 configure_kdesu_for_sudo() {
