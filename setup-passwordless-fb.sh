@@ -160,6 +160,9 @@ detect_pkg_mgr() {
   if have_cmd pacman; then echo "pacman"; return 0; fi
   if have_cmd zypper; then echo "zypper"; return 0; fi
   if have_cmd apk; then echo "apk"; return 0; fi
+  if have_cmd emerge; then echo "emerge"; return 0; fi
+  if have_cmd xbps-install; then echo "xbps"; return 0; fi
+  if have_cmd eopkg; then echo "eopkg"; return 0; fi
   echo ""
 }
 
@@ -219,6 +222,18 @@ install_deps_if_missing() {
       ;;
     apk)
       sudo apk add sudo polkit
+      ;;
+    emerge)
+      # Gentoo / Funtoo
+      sudo emerge sudo polkit
+      ;;
+    xbps)
+      # Void Linux
+      sudo xbps-install -Sy sudo polkit
+      ;;
+    eopkg)
+      # Solus
+      sudo eopkg install -y sudo polkit
       ;;
     *)
       die "Unsupported package manager: $mgr"
@@ -754,9 +769,13 @@ configure_full_file_permissions() {
     # Count total files first (with interruptibility)
     log "[info] Counting files (this may take a moment)..."
     local total_files
-    total_files=$(find / -xdev 2>/dev/null | wc -l || echo 0)
-    
-    if [[ "$total_files" -gt 0 ]]; then
+    # We deliberately ignore failures in this pipeline and validate the result
+    # instead of mixing a partial count with a fallback value.
+    total_files=$(find / -xdev 2>/dev/null | wc -l 2>/dev/null | awk '{print $1}' || true)
+
+    # Only use a total when it looks like a sane non-zero integer; otherwise
+    # fall back to an open-ended progress indicator.
+    if [[ "$total_files" =~ ^[0-9]+$ && "$total_files" -gt 0 ]]; then
       log "[info] Found $total_files items. Starting ACL application with progress bar..."
       # Use find with pv to show progress, piping to setfacl
       find / -xdev -print0 2>/dev/null | pv -l -s "$total_files" | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
@@ -764,8 +783,8 @@ configure_full_file_permissions() {
         return 1
       }
     else
-      # Fallback if counting failed
-      log "[info] Could not count files. Using progress indicator without total..."
+      # Fallback if counting failed or produced an invalid value
+      log "[info] Could not count files reliably. Using progress indicator without total..."
       find / -xdev -print0 2>/dev/null | pv -l | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
         return 1
