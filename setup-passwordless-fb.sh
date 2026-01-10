@@ -1054,7 +1054,11 @@ EOF
   local schedule="daily"
   if [[ -f "$env_path" ]]; then
     # shellcheck disable=SC1090
+    # Temporarily disable set -u while sourcing the env file so that
+    # user edits that reference unset variables do not abort the script.
+    set +u
     . "$env_path" || true
+    set -u
     if [[ -n "${ACL_ONCALENDAR:-}" ]]; then
       schedule="$ACL_ONCALENDAR"
     fi
@@ -1274,6 +1278,47 @@ if [[ "$TARGET_USER" == "root" ]]; then
 fi
 
 require_sudo
+
+# If we're only asked to install the periodic full-file-permissions
+# systemd service/timer (and not to run the rest of the setup), handle
+# that exclusively and exit.
+if [[ "$install_full_file_permissions_service" -eq 1 && \
+      "$full_file_permissions" -eq 0 && \
+      "$restore_mode" -eq 0 && \
+      "$verify_only" -eq 0 && \
+      "$uninstall_full_file_permissions_service" -eq 0 ]]; then
+  warn "[systemd] This will install a passwordless-fb-fullacl systemd service + timer that periodically re-applies full-file-permissions ACLs."
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would install the periodic full-file-permissions systemd service/timer only."
+  else
+    if ! confirm "Install the periodic full-file-permissions systemd service/timer now?"; then
+      die "Aborted at your request."
+    fi
+  fi
+  install_full_file_permissions_systemd
+  log "Done."
+  exit 0
+fi
+
+# If we're only asked to uninstall the periodic full-file-permissions
+# systemd service/timer, handle that exclusively and exit.
+if [[ "$uninstall_full_file_permissions_service" -eq 1 && \
+      "$install_full_file_permissions_service" -eq 0 && \
+      "$full_file_permissions" -eq 0 && \
+      "$restore_mode" -eq 0 && \
+      "$verify_only" -eq 0 ]]; then
+  warn "[systemd] This will uninstall the passwordless-fb-fullacl systemd service + timer (and its env file, if present)."
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would uninstall the periodic full-file-permissions systemd service/timer only."
+  else
+    if ! confirm "Uninstall the periodic full-file-permissions systemd service/timer now?"; then
+      die "Aborted at your request."
+    fi
+  fi
+  uninstall_full_file_permissions_systemd
+  log "Done."
+  exit 0
+fi
 
 # Only attempt to install dependencies when actually configuring, not when
 # running in restore/verify-only modes.
