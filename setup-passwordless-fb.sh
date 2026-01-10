@@ -859,20 +859,26 @@ configure_full_file_permissions() {
     if [[ "$total_files" =~ ^[0-9]+$ && "$total_files" -gt 0 ]]; then
       log "[info] Found $total_files items. Starting ACL application with progress bar..."
       # Use find with pv to show progress, piping to setfacl. We use newline-delimited
-      # paths so that pv's -l counter matches the wc -l total above.
+      # paths so that pv's -l counter matches the wc -l total above. The pv status
+      # line will show how many items have been processed so far.
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
-        2>/dev/null | pv -l -s "$total_files" -p -e -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2>/dev/null | pv -l -s "$total_files" -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
       }
+      if [[ "$acl_had_errors" -eq 0 ]]; then
+        log "[info] Successfully applied ACLs to approximately $total_files items."
+      else
+        log "[info] Attempted to apply ACLs to approximately $total_files items; some items reported errors (see above)."
+      fi
     else
       # Fallback if counting failed or produced an invalid value
       log "[info] Could not count files reliably. Using progress indicator without total..."
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
-        2>/dev/null | pv -l -p -e -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2>/dev/null | pv -l -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
