@@ -15,7 +15,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--all-groups] [--delete-passwd-on-polkit-fail]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail]
 
 Options:
   --user USER                         Target USER (default: the invoking user running the script)
@@ -25,6 +25,8 @@ Options:
   --force                             Overwrite existing /etc/sudoers.d and polkit rule files for this user (backs up first)
   --dry-run                           Print what would change, but do not write files
   --full-file-permissions             Give TARGET_USER recursive rwx ACLs on the root filesystem (/); extremely dangerous
+  --install-full-file-permissions-service
+                                     Install a systemd service + timer that will periodically re-apply full-file-permissions ACLs in the background
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
