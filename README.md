@@ -127,6 +127,7 @@ If you do not fully understand or accept these risks, **do not run this script**
 - A Linux system with:
   - `sudo` installed and available
   - A functional `visudo` binary
+  - `bash` available (e.g. `/bin/bash`); the script uses Bash-specific features and **must not** be run with `sh`, `dash`, or other non-Bash shells.
 - A user account with:
   - Existing `sudo` rights (can run `sudo` with password at least once)
 - Optional (for polkit integration):
@@ -160,8 +161,10 @@ chmod +x setup-passwordless-fb.sh
 Basic usage:
 
 ```bash
-./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--delete-passwd-on-polkit-fail]
+./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config]
 ```
+
+> **Important:** This is a **Bash-only** script. Run it as `./setup-passwordless-fb.sh ...` or `bash setup-passwordless-fb.sh ...`. Do **not** run it with `sh`, `dash`, or `/bin/sh`, as that may cause errors like `unbound variable` or syntax errors.
 
 ### Options
 
@@ -217,6 +220,14 @@ Basic usage:
   - Removes `passwordless-fb-fullacl.service`, `passwordless-fb-fullacl.timer`, and `/etc/passwordless-fb-fullacl.conf` (if present).  
   - Runs `systemctl daemon-reload`.  
   - Exits without modifying sudoers, polkit, or other configuration.
+
+- `--default-config`  
+  Reset `/etc/passwordless-fb-fullacl.conf` back to its **default template** and exit without touching sudoers, polkit, groups, or systemd units.  
+  - Sets `ACL_TARGET_USER` to the current `TARGET_USER` (or `id -un` if unset).  
+  - Sets `ACL_EXTRA_ARGS="--sudo-only --no-install --yes"`.  
+  - Sets `ACL_ONCALENDAR="daily"`.  
+  - Respects `--dry-run` (prints what it would do instead of writing).  
+  - Also accepts the misspelled alias `--defualt-config` for convenience.
 
 - `--all-groups`  
   **Extremely dangerous**: enumerate **every group** on the system via `getent group` and add the target user to all of them (except those they are already a member of).  

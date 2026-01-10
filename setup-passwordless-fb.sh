@@ -15,7 +15,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config]
 
 Options:
   --user USER                         Target USER (default: the invoking user running the script)
@@ -29,6 +29,7 @@ Options:
                                      Install a systemd service + timer that will periodically re-apply full-file-permissions ACLs in the background
   --uninstall-full-file-permissions-service
                                      Remove the systemd service/timer and config installed by --install-full-file-permissions-service
+  --default-config                    Reset /etc/passwordless-fb-fullacl.conf to its default template (ACL_TARGET_USER=current user, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
@@ -58,6 +59,7 @@ install_full_file_permissions_service=0
 uninstall_full_file_permissions_service=0
 delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
+reset_fullacl_env_to_default=0
 TARGET_USER=""
 POLKIT_TMP=""
 POLKIT_RULE_PATH=""
@@ -105,6 +107,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --uninstall-full-file-permissions-service)
       uninstall_full_file_permissions_service=1
+      shift
+      ;;
+    --default-config|--defualt-config)
+      reset_fullacl_env_to_default=1
       shift
       ;;
     --delete-passwd-on-polkit-fail)
@@ -982,6 +988,44 @@ uninstall_full_file_permissions_systemd() {
   log "[systemd] Uninstall of ${service_name} units (and env file) complete."
 }
 
+reset_full_file_permissions_env_to_default() {
+  # Reset /etc/passwordless-fb-fullacl.conf to its default template.
+  local service_name="passwordless-fb-fullacl"
+  local env_path="/etc/${service_name}.conf"
+  local tmp_env
+  local default_target
+
+  default_target="${TARGET_USER:-}"
+  if [[ -z "$default_target" ]]; then
+    default_target="$(id -un 2>/dev/null || echo "")"
+  fi
+  if [[ -z "$default_target" ]]; then
+    die "Could not determine default target user when resetting $env_path."
+  fi
+
+  tmp_env="$(mktemp)"
+  cat >"$tmp_env" <<EOF
+# Environment for ${service_name}
+# User that should receive full-file-permissions ACLs.
+# Change this to a different user name if needed.
+ACL_TARGET_USER=${default_target}
+
+# Extra arguments passed to setup-passwordless-fb.sh when run from the service.
+# By default we avoid reinstalling anything and run non-interactively.
+ACL_EXTRA_ARGS="--sudo-only --no-install --yes"
+
+# How often to run the full-file-permissions service. This is copied directly
+# into the systemd timer's OnCalendar= setting. Examples:
+#   ACL_ONCALENDAR="daily"          # once per day (default)
+#   ACL_ONCALENDAR="hourly"         # every hour
+#   ACL_ONCALENDAR="Mon..Fri 02:00" # weekdays at 02:00
+ACL_ONCALENDAR="daily"
+EOF
+  write_root_file "$tmp_env" "$env_path" 0644
+  rm -f "$tmp_env"
+  log "[systemd] Reset $env_path to default contents (ACL_TARGET_USER=${default_target}, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)."
+}
+
 install_full_file_permissions_systemd() {
   # Install a systemd service + timer that will periodically re-apply
   # --full-file-permissions ACLs in the background.
@@ -1038,29 +1082,34 @@ EOF
   : "${ACL_EXTRA_ARGS:=--sudo-only --no-install --yes}"
 
   # Service unit: one-shot job that runs the script once.
+  #
+  # IMPORTANT: We intentionally resolve defaults for the target user and extra
+  # arguments at generation time, but the *effective* values used at runtime
+  # come from /etc/passwordless-fb-fullacl.conf via EnvironmentFile. This
+  # means you can change ACL_TARGET_USER / ACL_EXTRA_ARGS in that file and the
+  # next timer run will automatically pick them up without re-running this
+  # installer script.
   local tmp_srv
   tmp_srv="$(mktemp)"
-  # Resolve the effective target user for the unit now to avoid relying on
-  # shell expansion of ACL_TARGET_USER under set -u when generating the unit.
+  # Resolve default target user for the unit now so we have a sane fallback
+  # when ACL_TARGET_USER is unset in the env file.
   local acl_target_for_unit
   acl_target_for_unit="${ACL_TARGET_USER:-$default_target}"
 
-  # We also bake ACL_EXTRA_ARGS directly into the unit at generation time
-  # instead of relying on shell expansion inside ExecStart. This avoids
-  # systemd warnings about unknown escape sequences and keeps the unit
-  # behavior predictable even if the env file is later edited.
+  # Default extra args; these are only used if ACL_EXTRA_ARGS is unset in the
+  # env file at service runtime.
   local acl_extra_for_unit
   acl_extra_for_unit="$ACL_EXTRA_ARGS"
 
   cat >"$tmp_srv" <<EOF
 [Unit]
-Description=Apply full-file-permissions ACLs for $acl_target_for_unit via setup-passwordless-fb.sh
+Description=Apply full-file-permissions ACLs via setup-passwordless-fb.sh (user from /etc/passwordless-fb-fullacl.conf)
 After=local-fs.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=-$env_path
-ExecStart=/usr/bin/env bash $script_path --user $acl_target_for_unit --full-file-permissions $acl_extra_for_unit
+ExecStart=/usr/bin/env bash -c 'set -euo pipefail; user="\${ACL_TARGET_USER:-'$acl_target_for_unit'}"; extra="\${ACL_EXTRA_ARGS:-'$acl_extra_for_unit'}"; exec /usr/bin/env bash "\$0" --user "\$user" --full-file-permissions \$extra' "$script_path"
 EOF
   write_root_file "$tmp_srv" "$service_path" 0644
   rm -f "$tmp_srv"
@@ -1293,6 +1342,27 @@ if [[ "$TARGET_USER" == "root" ]]; then
 fi
 
 require_sudo
+
+# If we're only asked to reset the periodic full-file-permissions env
+# config file to its default template, handle that exclusively and exit.
+if [[ "$reset_fullacl_env_to_default" -eq 1 && \
+      "$install_full_file_permissions_service" -eq 0 && \
+      "$uninstall_full_file_permissions_service" -eq 0 && \
+      "$full_file_permissions" -eq 0 && \
+      "$restore_mode" -eq 0 && \
+      "$verify_only" -eq 0 ]]; then
+  warn "[systemd] This will reset /etc/passwordless-fb-fullacl.conf to its default template."
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would reset /etc/passwordless-fb-fullacl.conf to default contents."
+  else
+    if ! confirm "Reset /etc/passwordless-fb-fullacl.conf to default now?"; then
+      die "Aborted at your request."
+    fi
+  fi
+  reset_full_file_permissions_env_to_default
+  log "Done."
+  exit 0
+fi
 
 # If we're only asked to install the periodic full-file-permissions
 # systemd service/timer (and not to run the rest of the setup), handle
