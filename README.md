@@ -160,7 +160,7 @@ chmod +x setup-passwordless-fb.sh
 Basic usage:
 
 ```bash
-./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--delete-passwd-on-polkit-fail]
+./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--delete-passwd-on-polkit-fail]
 ```
 
 ### Options
@@ -188,6 +188,35 @@ Basic usage:
   This does **not** change UIDs/groups/sudoers, but it removes important enforcement layers, making any existing privileges more powerful.  
   The script will still prompt you for confirmation unless `--yes` is also provided.  
   In `--verify` mode, `--relax-mac` does **not** relax anything, but the script will always print a **detailed MAC status report** (AppArmor present/active, SELinux mode).
+
+- `--full-file-permissions`  
+  **Nuclear option**: after the normal passwordless setup completes, run a recursive ACL grant equivalent to:
+
+  ```bash
+  setfacl -R -m u:<TARGET_USER>:rwx /
+  ```
+
+  The script wraps this in **extra confirmations**, logs detailed progress using `pv` (including an item count and approximate items/sec), and prints a concise summary at the end.  
+  A small sample of distinct `setfacl` errors (e.g. read-only filesystems, unsupported ACLs) is shown at the end so you can see what failed **without** being flooded by thousands of lines.  
+  See the dedicated section [WARNING: Extremely dangerous `--full-file-permissions` option](#warning-extremely-dangerous--full-file-permissions-option) for a deep dive.
+
+- `--install-full-file-permissions-service`  
+  Install a **systemd service + timer** (`passwordless-fb-fullacl.service` / `passwordless-fb-fullacl.timer`) that periodically re-applies `--full-file-permissions` in the background.  
+  When you invoke the script with *only* this flag (no other modes like `--full-file-permissions`, `--restore`, `--verify`, etc.), it runs in a **"installer-only"** mode:
+  - Asks for confirmation once.  
+  - Writes/updates `/etc/passwordless-fb-fullacl.conf` (described in detail below).  
+  - Generates/installs the systemd service + timer units.  
+  - Runs `systemctl daemon-reload` and `systemctl enable --now passwordless-fb-fullacl.timer`.  
+  - Exits without touching sudoers, polkit, groups, or anything else.
+
+- `--uninstall-full-file-permissions-service`  
+  Uninstall the periodic full-ACL reapply service/timer.  
+  When used by itself, this also runs in an **exclusive uninstaller** mode:
+  - Shows a confirmation prompt.  
+  - Disables and stops `passwordless-fb-fullacl.timer` if it exists.  
+  - Removes `passwordless-fb-fullacl.service`, `passwordless-fb-fullacl.timer`, and `/etc/passwordless-fb-fullacl.conf` (if present).  
+  - Runs `systemctl daemon-reload`.  
+  - Exits without modifying sudoers, polkit, or other configuration.
 
 - `--all-groups`  
   **Extremely dangerous**: enumerate **every group** on the system via `getent group` and add the target user to all of them (except those they are already a member of).  
@@ -461,6 +490,66 @@ cd /path/to/Password-less
 - Shows what would be written/changed.
 - Does **not** actually write anything.
 
+### D. Install the periodic full-ACL systemd service only
+
+If you want a background job that periodically re-applies `--full-file-permissions` for a user (for example after package updates or filesystem changes), you can install the **systemd service/timer** without running the rest of the setup:
+
+```bash
+./setup-passwordless-fb.sh --install-full-file-permissions-service
+```
+
+What this does:
+
+- Prompts you with a clear warning that a periodic full-ACL job is being installed.
+- Writes (or reuses) `/etc/passwordless-fb-fullacl.conf`, which controls the behavior of the timer + service. A freshly created default file looks like:
+
+  ```ini
+  # Environment for passwordless-fb-fullacl
+  # User that should receive full-file-permissions ACLs.
+  # Change this to a different user name if needed.
+  ACL_TARGET_USER=<your-username>
+
+  # Extra arguments passed to setup-passwordless-fb.sh when run from the service.
+  # By default we avoid reinstalling anything and run non-interactively.
+  ACL_EXTRA_ARGS="--sudo-only --no-install --yes"
+
+  # How often to run the full-file-permissions service. This is copied directly
+  # into the systemd timer's OnCalendar= setting. Examples:
+  #   ACL_ONCALENDAR="daily"          # once per day (default)
+  #   ACL_ONCALENDAR="hourly"         # every hour
+  #   ACL_ONCALENDAR="Mon..Fri 02:00" # weekdays at 02:00
+  ACL_ONCALENDAR="daily"
+  ```
+
+  - `ACL_TARGET_USER` – which user receives the ACLs. If unset, the installer resolves it to the invoking user and bakes that into the unit.
+  - `ACL_EXTRA_ARGS` – extra arguments passed to the script when run from the service. If you remove this line, the installer safely defaults it back to `--sudo-only --no-install --yes` so the unit stays valid.
+  - `ACL_ONCALENDAR` – systemd calendar expression controlling how often the job runs. If omitted, it falls back to `daily`.
+- Creates `passwordless-fb-fullacl.service` that runs roughly:
+
+  ```ini
+  ExecStart=/usr/bin/env bash /path/to/setup-passwordless-fb.sh --user ACL_TARGET_USER --full-file-permissions ACL_EXTRA_ARGS
+  ```
+
+- Creates `passwordless-fb-fullacl.timer` that triggers the service according to `ACL_ONCALENDAR`.
+- Reloads systemd units and immediately enables/starts the timer.
+
+> The service uses the same `pv`-backed progress, runtime measurement, and ACL error sampling as the interactive `--full-file-permissions` run. It is still extremely dangerous and should only be used on machines where you fully accept the security and stability trade-offs.
+
+### E. Uninstall the periodic full-ACL systemd service only
+
+To remove the service/timer and its config without touching anything else:
+
+```bash
+./setup-passwordless-fb.sh --uninstall-full-file-permissions-service
+```
+
+This:
+
+- Confirms with you interactively (unless `--yes` is also given).  
+- Disables and stops the timer if it exists.  
+- Deletes the service unit, timer unit, and `/etc/passwordless-fb-fullacl.conf` (if present).  
+- Reloads systemd.
+
 ---
 
 ## Idempotency
@@ -592,7 +681,50 @@ This means:
 - It grants the target user explicit **read, write, and execute** (`rwx`) permissions on **every file and directory that is reachable from `/` and supports ACLs**.
 - This ACL grant is **additive** – it does not replace the existing owner/group/mode bits – it layers an additional access rule on top. In effect, the chosen user becomes able to read/modify/delete/execute almost anything on the system, regardless of traditional Unix permissions.
 
-Because of the breadth and depth of this change, using `--full-file-permissions` is **much more invasive** than simply granting passwordless sudo.
+When you run with `--full-file-permissions`, the script also:
+
+- Detects and installs `pv` when needed (via your distro’s package manager) so that large ACL runs have a proper progress indicator.  
+- Counts how many filesystem entries will be touched and prints a line such as:
+
+  ```text
+  [info] Found 234882 items. Starting ACL application with progress bar...
+  ```
+
+- Streams paths through `pv` with `-l` (line-based) and labels the stream `Applying ACLs`, so you see a live bar like:
+
+  ```text
+  Applying ACLs: [======>...]  45%  105,000 / 234,882  3.2k/s  00:35
+  ```
+
+- Measures runtime and prints a summary with an approximate throughput, e.g.:
+
+  ```text
+  [info] Successfully applied ACLs to approximately 234882 items in 42s (~5592 items/sec).
+  ```
+
+- Captures `setfacl` stderr into a temporary log, filters out the usual noisy lines (like operations on read-only or unsupported filesystems), and at the end prints **up to five unique error samples** such as:
+
+  ```text
+  [info] Sample of ACL errors (up to 5 unique messages):
+  [acl-error] /sys/...: Operation not supported
+  [acl-error] /run/...: Read-only file system
+  ```
+
+This gives you a clear sense of **how much** was processed, **how fast**, and **what kind of things failed**, without drowning you in raw error spam.
+
+Because of the breadth and depth of this change, using `--full-file-permissions` is still **much more invasive** than simply granting passwordless sudo.
+
+### Desktop notifications and progress UX for `--full-file-permissions`
+
+On systems with a desktop session and `notify-send` available, the script also emits **desktop notifications** for full-ACL runs:
+
+- When a `--full-file-permissions` run starts (either interactive or via the systemd service):
+  - A notification such as: _"Applying recursive ACLs on / for <USER>. This may take a while and can affect many files."_
+- When it finishes:
+  - If it completed cleanly: _"ACL application on / for <USER> is complete. Full-file-permissions are now in effect."_
+  - If there were errors: _"ACL application on / for <USER> finished with some errors. Check terminal output if you care about 100% coverage."_
+
+The script best-effort targets the user’s graphical session (via the user’s D-Bus session bus) when running as root (e.g. from the systemd service). If no GUI or `notify-send` is available, these notifications are silently skipped.
 
 ### Why this is more dangerous than passwordless sudo
 
@@ -663,6 +795,8 @@ Even in these cases, there are usually **better alternatives**, such as:
 - Mounting specific directories with permissive settings or separate ACLs, instead of modifying the entire root filesystem.
 - Relying on passwordless sudo alone, which is already powerful but does not rewrite ACLs on every file.
 
+If you find yourself needing this power repeatedly, consider pushing it into a **disposable VM** or container rather than your main OS, or at minimum using the **systemd timer** so you understand *when* ACLs are being refreshed instead of re-running the script manually in ad-hoc ways.
+
 ### How to use it (and why you probably shouldn’t)
 
 If you still decide to enable it, the typical usage is:
@@ -716,6 +850,25 @@ Because of this, you should treat `--full-file-permissions` as a **"nuclear" opt
 
 If you are not absolutely certain you understand all of the above, **do not use `--full-file-permissions`**.
 
+
+## Desktop Integration (KDE and PAM `su`)
+
+In addition to sudoers and (optionally) polkit, the script makes a few desktop-related adjustments to align graphical tools with the passwordless setup.
+
+### KDE `kdesu` / "Run as root" helper
+
+On KDE/Plasma systems where `kwriteconfig5` is available and the desktop session is detected as KDE/Plasma, the script configures the `kdesu` helper to use `sudo` instead of `su`.
+
+- This is done by writing to the `kdesurc` configuration using:
+  - `kwriteconfig5 --file kdesurc --group super-user-command --key super-user-command sudo`
+- Effect: graphical "Run as root" prompts will respect the same passwordless sudo configuration you have just set up, instead of asking for a separate `root` password.
+- If `kwriteconfig5` is not present or the session is not KDE/Plasma, this step is skipped.
+
+### PAM `su` integration for `wheel` users
+
+As described earlier, the script also adjusts PAM configuration for `su`/`su-l` so that users in the `wheel` group can invoke `su` **without a password**, by adding the `trust` option to the `pam_wheel.so` line in a safe, idempotent way. This change only applies when a suitable PAM `su` service file exists and is copied into `/etc/pam.d` if necessary.
+
+These integrations are optional and best-effort, but they help align **GUI tools** and the classic `su` command with the passwordless sudo configuration, so you don’t end up in a state where some tools recognize the passwordless setup and others still prompt unexpectedly.
 
 ## Contributing
 

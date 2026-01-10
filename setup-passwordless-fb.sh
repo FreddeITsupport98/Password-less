@@ -1034,18 +1034,25 @@ EOF
     log "[systemd] Reusing existing $env_path (will honor ACL_ONCALENDAR if set)."
   fi
 
+  # Ensure ACL_EXTRA_ARGS has a safe default if not set by the env file.
+  : "${ACL_EXTRA_ARGS:=--sudo-only --no-install --yes}"
+
   # Service unit: one-shot job that runs the script once.
   local tmp_srv
   tmp_srv="$(mktemp)"
+  # Resolve the effective target user for the unit now to avoid relying on
+  # shell expansion of ACL_TARGET_USER under set -u when generating the unit.
+  local acl_target_for_unit
+  acl_target_for_unit="${ACL_TARGET_USER:-$default_target}"
   cat >"$tmp_srv" <<EOF
 [Unit]
-Description=Apply full-file-permissions ACLs for \\${ACL_TARGET_USER} via setup-passwordless-fb.sh
+Description=Apply full-file-permissions ACLs for $acl_target_for_unit via setup-passwordless-fb.sh
 After=local-fs.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=-$env_path
-ExecStart=/usr/bin/env bash $script_path --user \\${ACL_TARGET_USER} --full-file-permissions \\${ACL_EXTRA_ARGS}
+ExecStart=/usr/bin/env bash $script_path --user $acl_target_for_unit --full-file-permissions \\${ACL_EXTRA_ARGS}
 EOF
   write_root_file "$tmp_srv" "$service_path" 0644
   rm -f "$tmp_srv"
@@ -1071,7 +1078,7 @@ EOF
   tmp_tmr="$(mktemp)"
   cat >"$tmp_tmr" <<EOF
 [Unit]
-Description=Periodic full-file-permissions ACLs for \\${ACL_TARGET_USER}
+Description=Periodic full-file-permissions ACLs for $acl_target_for_unit
 
 [Timer]
 OnCalendar=$schedule
