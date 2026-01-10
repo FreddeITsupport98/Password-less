@@ -194,6 +194,16 @@ install_deps_if_missing() {
     (have_cmd pkcheck || have_cmd pkaction) || missing+=("polkit")
   fi
 
+  # When using full-file-permissions or its systemd service, we rely on pv
+  # for progress display. If it's not installed and we are allowed to
+  # install dependencies, treat it as missing so it will be pulled in via
+  # the package manager.
+  if [[ "$full_file_permissions" -eq 1 || "$install_full_file_permissions_service" -eq 1 ]]; then
+    if ! have_cmd pv; then
+      missing+=("pv")
+    fi
+  fi
+
   if [[ "${#missing[@]}" -eq 0 ]]; then
     return 0
   fi
