@@ -784,15 +784,15 @@ configure_full_file_permissions() {
       log "[info] Found $total_files items. Starting ACL application with progress bar..."
       # Use find with pv to show progress, piping to setfacl. We use newline-delimited
       # paths so that pv's -l counter matches the wc -l total above.
-      find / -xdev 2>/dev/null | pv -l -s "$total_files" | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
-        warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
+      find / -xdev 2>/dev/null | pv -l -s "$total_files" | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" || {
+        warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
       }
     else
       # Fallback if counting failed or produced an invalid value
       log "[info] Could not count files reliably. Using progress indicator without total..."
-      find / -xdev 2>/dev/null | pv -l | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
-        warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
+      find / -xdev 2>/dev/null | pv -l | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" || {
+        warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
       }
     fi
