@@ -815,6 +815,10 @@ configure_full_file_permissions() {
   # This is equivalent in practice to full system compromise for that user.
   # The user requested this behavior; we guard it behind an explicit flag and
   # an extra confirmation prompt.
+  local acl_had_errors=0
+  local acl_err_log
+  acl_err_log="$(mktemp)"
+
   warn "You requested to grant '$TARGET_USER' full rwx ACLs on /.".
   warn "This will run: setfacl -R -m u:$TARGET_USER:rwx / (as root)"
   warn "This is extremely dangerous and may irreversibly change permissions across the system."
@@ -841,7 +845,7 @@ configure_full_file_permissions() {
   # Track whether we saw any failures while applying ACLs. We always return 0
   # from this function so that partial failures do not abort the entire
   # passwordless configuration flow, but we still surface a warning.
-  local acl_had_errors=0
+  # (acl_had_errors is declared at the top of this function.)
   
   # Check if pv is available for progress display
   if have_cmd pv; then
@@ -858,31 +862,52 @@ configure_full_file_permissions() {
     # fall back to an open-ended progress indicator.
     if [[ "$total_files" =~ ^[0-9]+$ && "$total_files" -gt 0 ]]; then
       log "[info] Found $total_files items. Starting ACL application with progress bar..."
-      # Use find with pv to show progress, piping to setfacl. We use newline-delimited
-      # paths so that pv's -l counter matches the wc -l total above. The pv status
-      # line will show how many items have been processed so far.
+      # Use find + pv to show progress, piping to setfacl. We use newline-delimited
+      # paths so that pv's -l counter matches the wc -l total above.
+      local start_ts end_ts elapsed rate
+      start_ts="$(date +%s)"
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
         2>/dev/null | pv -l -s "$total_files" -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
-        2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
-        warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
+        2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' | tee -a "$acl_err_log" >&2) || {
+        warn "ACL application encountered some errors (often due to read-only filesystems or unsupported ACLs). Some files may not have been processed. See setfacl warnings above if you care about 100% coverage."
         acl_had_errors=1
       }
-      if [[ "$acl_had_errors" -eq 0 ]]; then
-        log "[info] Successfully applied ACLs to approximately $total_files items."
+      end_ts="$(date +%s)"
+      if [[ "$end_ts" -le "$start_ts" ]]; then
+        elapsed=1
       else
-        log "[info] Attempted to apply ACLs to approximately $total_files items; some items reported errors (see above)."
+        elapsed=$(( end_ts - start_ts ))
+      fi
+      rate=$(( total_files / elapsed ))
+      if [[ "$acl_had_errors" -eq 0 ]]; then
+        log "[info] Successfully applied ACLs to approximately $total_files items in ${elapsed}s (~${rate} items/sec)."
+      else
+        log "[info] Attempted to apply ACLs to approximately $total_files items in ${elapsed}s (~${rate} items/sec); some items reported errors (see a sample below)."
       fi
     else
       # Fallback if counting failed or produced an invalid value
       log "[info] Could not count files reliably. Using progress indicator without total..."
+      local start_ts end_ts elapsed
+      start_ts="$(date +%s)"
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
         2>/dev/null | pv -l -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
-        2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
-        warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
+        2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' | tee -a "$acl_err_log" >&2) || {
+        warn "ACL application encountered some errors (often due to read-only filesystems or unsupported ACLs). Some files may not have been processed. See setfacl warnings above if you care about 100% coverage."
         acl_had_errors=1
       }
+      end_ts="$(date +%s)"
+      if [[ "$end_ts" -le "$start_ts" ]]; then
+        elapsed=1
+      else
+        elapsed=$(( end_ts - start_ts ))
+      fi
+      if [[ "$acl_had_errors" -eq 0 ]]; then
+        log "[info] Finished applying ACLs (elapsed ~${elapsed}s)."
+      else
+        log "[info] Finished applying ACLs with some errors (elapsed ~${elapsed}s; see a sample below)."
+      fi
     fi
   else
     # No pv available, fall back to original command with spinner
@@ -901,9 +926,17 @@ configure_full_file_permissions() {
   fi
 
   # Notify the user that the full-file-permissions run has finished (best-effort).
+  # If there were errors, show a small sample of distinct messages so the user
+  # can see the kinds of failures without being flooded.
+  if [[ -s "$acl_err_log" ]]; then
+    log "[info] Sample of ACL errors (up to 5 unique messages):"
+    awk '{sub(/^setfacl: /,""); print}' "$acl_err_log" | sort -u | head -n 5 | sed 's/^/[acl-error] /' >&2 || true
+  fi
+  rm -f "$acl_err_log" 2>/dev/null || true
+
   if [[ "$acl_had_errors" -eq 1 ]]; then
     send_fullacl_notification "Password-less full-file-permissions" \
-      "ACL application on / for $TARGET_USER finished with some errors. Check logs if you care about 100%% coverage."
+      "ACL application on / for $TARGET_USER finished with some errors. Check terminal output if you care about 100%% coverage."
   else
     send_fullacl_notification "Password-less full-file-permissions" \
       "ACL application on / for $TARGET_USER is complete. Full-file-permissions are now in effect."
