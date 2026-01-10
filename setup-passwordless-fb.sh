@@ -747,7 +747,40 @@ configure_full_file_permissions() {
     die "Aborted full-file-permissions at your request."
   fi
 
-  sudo setfacl -R -m "u:$TARGET_USER:rwx" /
+  log "[info] Applying recursive ACLs... This may take a while. Press Ctrl+C to cancel."
+  
+  # Check if pv is available for progress display
+  if have_cmd pv; then
+    # Count total files first (with interruptibility)
+    log "[info] Counting files (this may take a moment)..."
+    local total_files
+    total_files=$(find / -xdev 2>/dev/null | wc -l || echo 0)
+    
+    if [[ "$total_files" -gt 0 ]]; then
+      log "[info] Found $total_files items. Starting ACL application with progress bar..."
+      # Use find with pv to show progress, piping to setfacl
+      find / -xdev -print0 2>/dev/null | pv -l -s "$total_files" | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
+        warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
+        return 1
+      }
+    else
+      # Fallback if counting failed
+      log "[info] Could not count files. Using progress indicator without total..."
+      find / -xdev -print0 2>/dev/null | pv -l | xargs -0 -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" 2>/dev/null || {
+        warn "ACL application was interrupted or encountered errors. Some files may not have been processed."
+        return 1
+      }
+    fi
+  else
+    # No pv available, fall back to original command with spinner
+    log "[info] 'pv' not found. Running without progress bar (install 'pv' for progress display)..."
+    sudo setfacl -R -m "u:$TARGET_USER:rwx" / || {
+      warn "ACL application encountered errors or was interrupted."
+      return 1
+    }
+  fi
+  
+  log "[info] ACL application completed."
 }
 
 configure_kdesu_for_sudo() {
