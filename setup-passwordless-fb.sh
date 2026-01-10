@@ -15,7 +15,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail]
 
 Options:
   --user USER                         Target USER (default: the invoking user running the script)
@@ -27,6 +27,8 @@ Options:
   --full-file-permissions             Give TARGET_USER recursive rwx ACLs on the root filesystem (/); extremely dangerous
   --install-full-file-permissions-service
                                      Install a systemd service + timer that will periodically re-apply full-file-permissions ACLs in the background
+  --uninstall-full-file-permissions-service
+                                     Remove the systemd service/timer and config installed by --install-full-file-permissions-service
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
@@ -53,6 +55,7 @@ relax_mac=0
 full_file_permissions=0
 all_groups=0
 install_full_file_permissions_service=0
+uninstall_full_file_permissions_service=0
 delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
 TARGET_USER=""
@@ -98,6 +101,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-full-file-permissions-service)
       install_full_file_permissions_service=1
+      shift
+      ;;
+    --uninstall-full-file-permissions-service)
+      uninstall_full_file_permissions_service=1
       shift
       ;;
     --delete-passwd-on-polkit-fail)
@@ -217,31 +224,31 @@ install_deps_if_missing() {
       sudo apt-get install -y sudo policykit-1
       ;;
     dnf)
-      sudo dnf install -y sudo polkit
+      sudo dnf install -y sudo polkit pv
       ;;
     yum)
-      sudo yum install -y sudo polkit
+      sudo yum install -y sudo polkit pv
       ;;
     pacman)
-      sudo pacman -Sy --noconfirm sudo polkit
+      sudo pacman -Sy --noconfirm sudo polkit pv
       ;;
     zypper)
-      sudo zypper --non-interactive install sudo polkit
+      sudo zypper --non-interactive install sudo polkit pv
       ;;
     apk)
       sudo apk add sudo polkit
       ;;
     emerge)
       # Gentoo / Funtoo
-      sudo emerge sudo polkit
+      sudo emerge sudo polkit pv
       ;;
     xbps)
       # Void Linux
-      sudo xbps-install -Sy sudo polkit
+      sudo xbps-install -Sy sudo polkit pv
       ;;
     eopkg)
       # Solus
-      sudo eopkg install -y sudo polkit
+      sudo eopkg install -y sudo polkit pv
       ;;
     *)
       die "Unsupported package manager: $mgr"
@@ -750,6 +757,49 @@ relax_mac_controls_if_requested() {
   warn "MAC relaxation (if any) was applied at runtime only. Persistent boot-time settings were NOT modified."
 }
 
+send_fullacl_notification() {
+  # Best-effort desktop notification helper for full-file-permissions runs.
+  # Uses notify-send when available. On a desktop system this should show a
+  # popup; on headless systems it silently does nothing.
+  local title="$1"
+  local body="$2"
+
+  if ! have_cmd notify-send; then
+    return 0
+  fi
+
+  # Determine which user/session to target. Prefer TARGET_USER, fall back to
+  # the current user name.
+  local u
+  u="${TARGET_USER:-$(id -un 2>/dev/null || echo "") }"
+  if [[ -z "$u" ]]; then
+    return 0
+  fi
+
+  # If we're not root, just call notify-send directly in the current session.
+  if [[ "$(id -u)" -ne 0 ]]; then
+    notify-send "$title" "$body" 2>/dev/null || true
+    return 0
+  fi
+
+  # When running as root (e.g. from the systemd service), try to target the
+  # user's graphical session via their user bus if it exists.
+  local uid bus
+  uid="$(id -u "$u" 2>/dev/null || echo "")"
+  if [[ -z "$uid" ]]; then
+    return 0
+  fi
+  bus="/run/user/$uid/bus"
+
+  if [[ -S "$bus" ]]; then
+    sudo -u "$u" DISPLAY=":0" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+      notify-send "$title" "$body" 2>/dev/null || true
+  else
+    # Fallback: rely on whatever DISPLAY/DBUS the user session may infer.
+    sudo -u "$u" notify-send "$title" "$body" 2>/dev/null || true
+  fi
+}
+
 configure_full_file_permissions() {
   # Give TARGET_USER recursive rwx ACLs on the root filesystem (/).
   # This is equivalent in practice to full system compromise for that user.
@@ -758,6 +808,10 @@ configure_full_file_permissions() {
   warn "You requested to grant '$TARGET_USER' full rwx ACLs on /.".
   warn "This will run: setfacl -R -m u:$TARGET_USER:rwx / (as root)"
   warn "This is extremely dangerous and may irreversibly change permissions across the system."
+
+  # Notify the user (best-effort) that a full-file-permissions run is starting.
+  send_fullacl_notification "Password-less full-file-permissions" \
+    "Applying recursive ACLs on / for $TARGET_USER. This may take a while and can affect many files."
 
   if ! have_cmd setfacl; then
     die "setfacl command not found; cannot apply full file permissions. Install acl utilities and re-run."
@@ -782,7 +836,7 @@ configure_full_file_permissions() {
   # Check if pv is available for progress display
   if have_cmd pv; then
     # Count total files first (with interruptibility)
-    log "[info] Counting files (this may take a moment)..."
+    log "[info] Counting files to apply ACLs to (this may take a moment)..."
     local total_files
     # We deliberately ignore failures in this pipeline and validate the result
     # instead of mixing a partial count with a fallback value.
@@ -798,7 +852,7 @@ configure_full_file_permissions() {
       # paths so that pv's -l counter matches the wc -l total above.
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
-        2>/dev/null | pv -l -s "$total_files" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2>/dev/null | pv -l -s "$total_files" -pe "Applying ACLs: %6.2f%%" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
@@ -808,7 +862,7 @@ configure_full_file_permissions() {
       log "[info] Could not count files reliably. Using progress indicator without total..."
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
-        2>/dev/null | pv -l | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2>/dev/null | pv -l -pe "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
@@ -830,8 +884,53 @@ configure_full_file_permissions() {
     log "[info] ACL application completed."
   fi
 
+  # Notify the user that the full-file-permissions run has finished (best-effort).
+  if [[ "$acl_had_errors" -eq 1 ]]; then
+    send_fullacl_notification "Password-less full-file-permissions" \
+      "ACL application on / for $TARGET_USER finished with some errors. Check logs if you care about 100%% coverage."
+  else
+    send_fullacl_notification "Password-less full-file-permissions" \
+      "ACL application on / for $TARGET_USER is complete. Full-file-permissions are now in effect."
+  fi
+
   # Never fail the overall script solely because some ACL applications failed.
   return 0
+}
+
+uninstall_full_file_permissions_systemd() {
+  # Remove the systemd service + timer + env file installed by
+  # install_full_file_permissions_systemd.
+  local service_name="passwordless-fb-fullacl"
+  local service_path="/etc/systemd/system/${service_name}.service"
+  local timer_path="/etc/systemd/system/${service_name}.timer"
+  local env_path="/etc/${service_name}.conf"
+
+  warn "[systemd] Uninstalling ${service_name}.service and ${service_name}.timer (if present)."
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would disable and stop ${service_name}.timer, remove $service_path, $timer_path, and $env_path, then run 'systemctl daemon-reload'."
+    return 0
+  fi
+
+  if have_cmd systemctl; then
+    sudo systemctl disable --now "${service_name}.timer" >/dev/null 2>&1 || true
+  fi
+
+  if sudo test -e "$service_path"; then
+    sudo rm -f "$service_path"
+  fi
+  if sudo test -e "$timer_path"; then
+    sudo rm -f "$timer_path"
+  fi
+  if sudo test -e "$env_path"; then
+    sudo rm -f "$env_path"
+  fi
+
+  if have_cmd systemctl; then
+    sudo systemctl daemon-reload || true
+  fi
+
+  log "[systemd] Uninstall of ${service_name} units (and env file) complete."
 }
 
 install_full_file_permissions_systemd() {
@@ -1183,6 +1282,12 @@ fi
 
 # Optionally relax MAC (AppArmor/SELinux) controls or report their status.
 relax_mac_controls_if_requested
+
+# If requested, uninstall the periodic full-file-permissions systemd units and exit.
+if [[ "$uninstall_full_file_permissions_service" -eq 1 ]]; then
+  uninstall_full_file_permissions_systemd
+  exit 0
+fi
 
 VISUDO_BIN="$(find_visudo)"
 [[ -n "$VISUDO_BIN" ]] || die "visudo not found. Install sudo/visudo and ensure it's available (often in /usr/sbin)."
