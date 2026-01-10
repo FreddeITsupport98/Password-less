@@ -862,7 +862,7 @@ configure_full_file_permissions() {
       # paths so that pv's -l counter matches the wc -l total above.
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
-        2>/dev/null | pv -l -s "$total_files" -pe "Applying ACLs: %6.2f%%" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2>/dev/null | pv -l -s "$total_files" -p -e -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
@@ -872,7 +872,7 @@ configure_full_file_permissions() {
       log "[info] Could not count files reliably. Using progress indicator without total..."
       find / -xdev \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
-        2>/dev/null | pv -l -pe "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2>/dev/null | pv -l -p -e -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
