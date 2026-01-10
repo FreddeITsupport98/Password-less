@@ -50,10 +50,12 @@ verify_only=0
 relax_mac=0
 full_file_permissions=0
 all_groups=0
+install_full_file_permissions_service=0
 delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
 TARGET_USER=""
 POLKIT_TMP=""
+POLKIT_RULE_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all-groups)
       all_groups=1
+      shift
+      ;;
+    --install-full-file-permissions-service)
+      install_full_file_permissions_service=1
       shift
       ;;
     --delete-passwd-on-polkit-fail)
@@ -296,12 +302,14 @@ write_root_file() {
 }
 
 ensure_sudoers_permissions() {
-  # Some distros (e.g. openSUSE) ship a primary sudoers file in /usr/etc/sudoers
-  # which visudo -c will validate. If that file has overly permissive
-  # permissions, visudo will fail even if our drop-in is fine. Normalize
-  # ownership and mode on the core sudoers files before running visudo.
+  # Some distros (e.g. openSUSE) ship primary sudo configuration in /usr/etc,
+  # including /usr/etc/sudoers and /usr/etc/sudo.conf. If these files are
+  # group-writable or otherwise mis-permissioned, sudo/visudo will spam
+  # warnings (e.g. "sudo.conf is group writable") or even refuse to run.
+  # Normalize ownership and mode on the core sudoers-related files before
+  # running visudo or performing other sudo operations.
   local path
-  for path in /etc/sudoers /usr/etc/sudoers; do
+  for path in /etc/sudoers /usr/etc/sudoers /usr/etc/sudo.conf; do
     if sudo test -e "$path"; then
       local owner group mode
       owner=$(sudo stat -c '%U' "$path" 2>/dev/null || echo "")
@@ -746,7 +754,7 @@ configure_full_file_permissions() {
   # The user requested this behavior; we guard it behind an explicit flag and
   # an extra confirmation prompt.
   warn "You requested to grant '$TARGET_USER' full rwx ACLs on /.".
-  warn "This will run: sudo setfacl -R -m u:$TARGET_USER:rwx /"
+  warn "This will run: setfacl -R -m u:$TARGET_USER:rwx / (as root)"
   warn "This is extremely dangerous and may irreversibly change permissions across the system."
 
   if ! have_cmd setfacl; then
@@ -754,7 +762,7 @@ configure_full_file_permissions() {
   fi
 
   if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would run: sudo setfacl -R -m u:$TARGET_USER:rwx /"
+    log "[dry-run] Would run: setfacl -R -m u:$TARGET_USER:rwx / (as root)"
     return 0
   fi
 
@@ -776,7 +784,9 @@ configure_full_file_permissions() {
     local total_files
     # We deliberately ignore failures in this pipeline and validate the result
     # instead of mixing a partial count with a fallback value.
-    total_files=$(find / -xdev 2>/dev/null | wc -l 2>/dev/null | awk '{print $1}' || true)
+    total_files=$(find / -xdev \
+      \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
+      2>/dev/null | wc -l 2>/dev/null | awk '{print $1}' || true)
 
     # Only use a total when it looks like a sane non-zero integer; otherwise
     # fall back to an open-ended progress indicator.
@@ -784,14 +794,20 @@ configure_full_file_permissions() {
       log "[info] Found $total_files items. Starting ACL application with progress bar..."
       # Use find with pv to show progress, piping to setfacl. We use newline-delimited
       # paths so that pv's -l counter matches the wc -l total above.
-      find / -xdev 2>/dev/null | pv -l -s "$total_files" | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" || {
+      find / -xdev \
+        \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
+        2>/dev/null | pv -l -s "$total_files" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
       }
     else
       # Fallback if counting failed or produced an invalid value
       log "[info] Could not count files reliably. Using progress indicator without total..."
-      find / -xdev 2>/dev/null | pv -l | xargs -r -d '\n' -n 100 sudo setfacl -m "u:$TARGET_USER:rwx" || {
+      find / -xdev \
+        \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
+        2>/dev/null | pv -l | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+        2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application was interrupted or encountered errors. Some files may not have been processed. See setfacl errors above."
         acl_had_errors=1
       }
@@ -799,7 +815,8 @@ configure_full_file_permissions() {
   else
     # No pv available, fall back to original command with spinner
     log "[info] 'pv' not found. Running without progress bar (install 'pv' for progress display)..."
-    sudo setfacl -R -m "u:$TARGET_USER:rwx" / || {
+    setfacl -R -m "u:$TARGET_USER:rwx" / \
+      2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
       warn "ACL application encountered errors or was interrupted. Some files may not have been processed."
       acl_had_errors=1
     }
@@ -813,6 +830,109 @@ configure_full_file_permissions() {
 
   # Never fail the overall script solely because some ACL applications failed.
   return 0
+}
+
+install_full_file_permissions_systemd() {
+  # Install a systemd service + timer that will periodically re-apply
+  # --full-file-permissions ACLs in the background.
+  local service_name="passwordless-fb-fullacl"
+  local service_path="/etc/systemd/system/${service_name}.service"
+  local timer_path="/etc/systemd/system/${service_name}.timer"
+  local env_path="/etc/${service_name}.conf"
+  local script_path
+
+  script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+  warn "[systemd] Installing ${service_name}.service and ${service_name}.timer for periodic full-file-permissions runs."
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would write $env_path, $service_path, $timer_path and run 'systemctl daemon-reload' + 'systemctl enable --now ${service_name}.timer'."
+    return 0
+  fi
+
+  # Environment file: controls which user to target and any extra args. If it
+  # already exists, we keep it and only read settings from it.
+  local tmp_env
+  local default_target="${TARGET_USER:-}"
+  if [[ -z "$default_target" ]]; then
+    default_target="$(id -un 2>/dev/null || echo "")"
+  fi
+
+  if [[ ! -f "$env_path" ]]; then
+    tmp_env="$(mktemp)"
+    cat >"$tmp_env" <<EOF
+# Environment for ${service_name}
+# User that should receive full-file-permissions ACLs.
+# Change this to a different user name if needed.
+ACL_TARGET_USER=${default_target}
+
+# Extra arguments passed to setup-passwordless-fb.sh when run from the service.
+# By default we avoid reinstalling anything and run non-interactively.
+ACL_EXTRA_ARGS="--sudo-only --no-install --yes"
+
+# How often to run the full-file-permissions service. This is copied directly
+# into the systemd timer's OnCalendar= setting. Examples:
+#   ACL_ONCALENDAR="daily"          # once per day (default)
+#   ACL_ONCALENDAR="hourly"         # every hour
+#   ACL_ONCALENDAR="Mon..Fri 02:00" # weekdays at 02:00
+ACL_ONCALENDAR="daily"
+EOF
+    write_root_file "$tmp_env" "$env_path" 0644
+    rm -f "$tmp_env"
+    log "[systemd] Wrote default config $env_path (edit ACL_TARGET_USER/ACL_ONCALENDAR/ACL_EXTRA_ARGS as needed)."
+  else
+    log "[systemd] Reusing existing $env_path (will honor ACL_ONCALENDAR if set)."
+  fi
+
+  # Service unit: one-shot job that runs the script once.
+  local tmp_srv
+  tmp_srv="$(mktemp)"
+  cat >"$tmp_srv" <<EOF
+[Unit]
+Description=Apply full-file-permissions ACLs for \\${ACL_TARGET_USER} via setup-passwordless-fb.sh
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-$env_path
+ExecStart=/usr/bin/env bash $script_path --user \\${ACL_TARGET_USER} --full-file-permissions \\${ACL_EXTRA_ARGS}
+EOF
+  write_root_file "$tmp_srv" "$service_path" 0644
+  rm -f "$tmp_srv"
+
+  # Determine the desired schedule from the env file (if present).
+  local schedule="daily"
+  if [[ -f "$env_path" ]]; then
+    # shellcheck disable=SC1090
+    . "$env_path" || true
+    if [[ -n "${ACL_ONCALENDAR:-}" ]]; then
+      schedule="$ACL_ONCALENDAR"
+    fi
+  fi
+
+  # Timer unit: uses the configured schedule. Users can also adjust via
+  # `systemctl edit ${service_name}.timer`, but editing $env_path and
+  # re-running this installer is the recommended way.
+  local tmp_tmr
+  tmp_tmr="$(mktemp)"
+  cat >"$tmp_tmr" <<EOF
+[Unit]
+Description=Periodic full-file-permissions ACLs for \\${ACL_TARGET_USER}
+
+[Timer]
+OnCalendar=$schedule
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  write_root_file "$tmp_tmr" "$timer_path" 0644
+  rm -f "$tmp_tmr"
+
+  log "[systemd] Reloading systemd units and enabling ${service_name}.timer..."
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "${service_name}.timer"
+  log "[systemd] Installed ${service_name}.service and ${service_name}.timer. Edit $env_path to change target user/args, and use 'systemctl edit ${service_name}.timer' to change the schedule."
 }
 
 configure_kdesu_for_sudo() {
@@ -975,11 +1095,18 @@ configure_pam_su_passwordless_for_wheel() {
 }
 
 # --- Sanity checks ---
-if [[ "$(id -u)" -eq 0 ]]; then
-  if [[ "$full_file_permissions" -eq 1 ]]; then
-    warn "Running as root with --full-file-permissions; proceeding with extreme caution."
+# For the extremely dangerous --full-file-permissions mode, we require the
+# script itself to be run as root so we do not need to invoke sudo thousands of
+# times inside the ACL loop (which can spam sudo.conf warnings).
+if [[ "$full_file_permissions" -eq 1 ]]; then
+  if [[ "$(id -u)" -ne 0 ]]; then
+    die "--full-file-permissions must be run as root. Re-run via: sudo bash $SCRIPT_NAME --user $TARGET_USER --full-file-permissions"
   else
-    die "Do not run as root. Run as the target user with sudo access (unless you are only using --full-file-permissions)."
+    warn "Running as root with --full-file-permissions; proceeding with extreme caution."
+  fi
+else
+  if [[ "$(id -u)" -eq 0 ]]; then
+    die "Do not run as root. Run as the target user with sudo access (unless you are using --full-file-permissions)."
   fi
 fi
 
@@ -1198,6 +1325,15 @@ if [[ "$full_file_permissions" -eq 1 ]]; then
   configure_full_file_permissions
 fi
 
+if [[ "$install_full_file_permissions_service" -eq 1 ]]; then
+  log "[extra] Installing systemd service/timer for periodic full-file-permissions ACLs..."
+  install_full_file_permissions_systemd
+fi
+
 log "Done."
 log "[info] Some changes (group membership, PAM, polkit, ACLs) may only fully take effect after you log out and back in, or reboot the system."
-log "To undo: remove $SUDOERS_DEST, $POLKIT_RULE_PATH, and revert any changes to /etc/pam.d/su using the .bak.* backups created by this script (if present)."
+if [[ -n "$POLKIT_RULE_PATH" ]]; then
+  log "To undo: remove $SUDOERS_DEST, $POLKIT_RULE_PATH, and revert any changes to /etc/pam.d/su using the .bak.* backups created by this script (if present)."
+else
+  log "To undo: remove $SUDOERS_DEST and revert any changes to /etc/pam.d/su using the .bak.* backups created by this script (if present)."
+fi
