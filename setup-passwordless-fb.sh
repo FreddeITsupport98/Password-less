@@ -853,6 +853,25 @@ configure_full_file_permissions() {
   # passwordless configuration flow, but we still surface a warning.
   # (acl_had_errors is declared at the top of this function.)
   
+  # Common prune expression used by all find invocations below. We exclude
+  # pseudo-filesystems (proc, sys, dev, run, boot/efi, snap) **and** a set of
+  # particularly sensitive network configuration/state trees to reduce the
+  # chance of breaking core connectivity when applying ACLs.
+  #
+  # Currently excluded network trees (best-effort, cross-distro heuristics):
+  #   - NetworkManager: /etc/NetworkManager, /var/lib/NetworkManager, /usr/lib/NetworkManager
+  #   - systemd-networkd: /etc/systemd/network, /var/lib/systemd/network
+  #   - connman: /etc/connman, /var/lib/connman
+  #   - wpa_supplicant: /etc/wpa_supplicant, /var/lib/wpa_supplicant
+  #   - wicked (common on SUSE): /etc/wicked, /var/lib/wicked
+  local fullacl_prune
+  fullacl_prune='( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \
+                   -o -path /etc/NetworkManager -o -path /var/lib/NetworkManager -o -path /usr/lib/NetworkManager \
+                   -o -path /etc/systemd/network -o -path /var/lib/systemd/network \
+                   -o -path /etc/connman -o -path /var/lib/connman \
+                   -o -path /etc/wpa_supplicant -o -path /var/lib/wpa_supplicant \
+                   -o -path /etc/wicked -o -path /var/lib/wicked )'
+
   # Check if pv is available for progress display
   if have_cmd pv; then
     # Count total files first (with interruptibility)
@@ -861,7 +880,7 @@ configure_full_file_permissions() {
     # We deliberately ignore failures in this pipeline and validate the result
     # instead of mixing a partial count with a fallback value.
     total_files=$(find / -xdev \
-      \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
+      \( ${fullacl_prune} \) -prune -o -print \
       2>/dev/null | wc -l 2>/dev/null | awk '{print $1}' || true)
 
     # Only use a total when it looks like a sane non-zero integer; otherwise
@@ -873,7 +892,7 @@ configure_full_file_permissions() {
       local start_ts end_ts elapsed rate
       start_ts="$(date +%s)"
       find / -xdev \
-        \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
+        \( ${fullacl_prune} \) -prune -o -print \
         2>/dev/null | pv -l -s "$total_files" -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' | tee -a "$acl_err_log" >&2) || {
         warn "ACL application encountered some errors (often due to read-only filesystems or unsupported ACLs). Some files may not have been processed. See setfacl warnings above if you care about 100% coverage."
@@ -897,7 +916,7 @@ configure_full_file_permissions() {
       local start_ts end_ts elapsed
       start_ts="$(date +%s)"
       find / -xdev \
-        \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \) -prune -o -print \
+        \( ${fullacl_prune} \) -prune -o -print \
         2>/dev/null | pv -l -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' | tee -a "$acl_err_log" >&2) || {
         warn "ACL application encountered some errors (often due to read-only filesystems or unsupported ACLs). Some files may not have been processed. See setfacl warnings above if you care about 100% coverage."
@@ -916,9 +935,14 @@ configure_full_file_permissions() {
       fi
     fi
   else
-    # No pv available, fall back to original command with spinner
+    # No pv available, fall back to a simpler find+xargs pipeline (still using
+    # the same prune set) instead of a raw recursive setfacl on /. This keeps
+    # behavior consistent (including NetworkManager-related exclusions) and
+    # avoids hammering pseudo-filesystems.
     log "[info] 'pv' not found. Running without progress bar (install 'pv' for progress display)..."
-    setfacl -R -m "u:$TARGET_USER:rwx" / \
+    find / -xdev \
+      \( ${fullacl_prune} \) -prune -o -print \
+      2>/dev/null | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
       2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
       warn "ACL application encountered errors or was interrupted. Some files may not have been processed."
       acl_had_errors=1
@@ -1401,6 +1425,19 @@ if [[ "$uninstall_full_file_permissions_service" -eq 1 && \
     fi
   fi
   uninstall_full_file_permissions_systemd
+  log "Done."
+  exit 0
+fi
+
+# If we're asked to run only the full-file-permissions ACL pass (and not the
+# rest of the passwordless setup), handle that exclusively and exit.
+if [[ "$full_file_permissions" -eq 1 && \
+      "$install_full_file_permissions_service" -eq 0 && \
+      "$uninstall_full_file_permissions_service" -eq 0 && \
+      "$restore_mode" -eq 0 && \
+      "$verify_only" -eq 0 ]]; then
+  warn "[full-file-permissions] Running in ACL-only mode: will apply recursive ACLs for $TARGET_USER and then exit (no sudoers/polkit/group/PAM changes)."
+  configure_full_file_permissions
   log "Done."
   exit 0
 fi

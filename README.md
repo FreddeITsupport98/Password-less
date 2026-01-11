@@ -193,11 +193,20 @@ Basic usage:
   In `--verify` mode, `--relax-mac` does **not** relax anything, but the script will always print a **detailed MAC status report** (AppArmor present/active, SELinux mode).
 
 - `--full-file-permissions`  
-  **Nuclear option**: after the normal passwordless setup completes, run a recursive ACL grant equivalent to:
+  **Nuclear option** and **ACL-only mode**: when you invoke the script with this flag (and not in `--restore`/`--verify`/`--install-...`/`--uninstall-...` modes), it skips the normal passwordless sudo/polkit/group/PAM configuration and runs **only** a recursive ACL grant equivalent to:
 
   ```bash
   setfacl -R -m u:<TARGET_USER>:rwx /
   ```
+
+  Internally, the script now uses a `find` pipeline that **skips** several sensitive trees to reduce the chance of breaking core services:
+  - Pseudo-filesystems: `/proc`, `/sys`, `/dev`, `/run`, `/boot/efi`, `/snap`  
+  - Network stacks (best-effort, cross-distro):  
+    - NetworkManager: `/etc/NetworkManager`, `/var/lib/NetworkManager`, `/usr/lib/NetworkManager`  
+    - systemd-networkd: `/etc/systemd/network`, `/var/lib/systemd/network`  
+    - connman: `/etc/connman`, `/var/lib/connman`  
+    - wpa_supplicant: `/etc/wpa_supplicant`, `/var/lib/wpa_supplicant`  
+    - wicked (SUSE): `/etc/wicked`, `/var/lib/wicked`
 
   The script wraps this in **extra confirmations**, logs detailed progress using `pv` (including an item count and approximate items/sec), and prints a concise summary at the end.  
   A small sample of distinct `setfacl` errors (e.g. read-only filesystems, unsupported ACLs) is shown at the end so you can see what failed **without** being flooded by thousands of lines.  
