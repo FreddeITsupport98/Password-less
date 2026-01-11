@@ -983,6 +983,7 @@ uninstall_full_file_permissions_systemd() {
   local service_path="/etc/systemd/system/${service_name}.service"
   local timer_path="/etc/systemd/system/${service_name}.timer"
   local env_path="/etc/${service_name}.conf"
+  local system_script_path="/usr/local/bin/setup-passwordless-fb.sh"
 
   warn "[systemd] Uninstalling ${service_name}.service and ${service_name}.timer (if present)."
 
@@ -1003,6 +1004,10 @@ uninstall_full_file_permissions_systemd() {
   fi
   if sudo test -e "$env_path"; then
     sudo rm -f "$env_path"
+  fi
+  if sudo test -e "$system_script_path"; then
+    log "[systemd] Removing system script copy at $system_script_path"
+    sudo rm -f "$system_script_path"
   fi
 
   if have_cmd systemctl; then
@@ -1058,8 +1063,20 @@ install_full_file_permissions_systemd() {
   local timer_path="/etc/systemd/system/${service_name}.timer"
   local env_path="/etc/${service_name}.conf"
   local script_path
+  local system_script_path="/usr/local/bin/setup-passwordless-fb.sh"
 
   script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+  # Copy the script to a system location so it's independent of the original file location
+  log "[systemd] Installing script to $system_script_path..."
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would copy $script_path to $system_script_path"
+  else
+    sudo install -o root -g root -m 0755 "$script_path" "$system_script_path"
+  fi
+  
+  # Use the system copy in the service
+  script_path="$system_script_path"
 
   warn "[systemd] Installing ${service_name}.service and ${service_name}.timer for periodic full-file-permissions runs."
 
@@ -1397,6 +1414,10 @@ if [[ "$install_full_file_permissions_service" -eq 1 && \
       "$verify_only" -eq 0 && \
       "$uninstall_full_file_permissions_service" -eq 0 ]]; then
   warn "[systemd] This will install a passwordless-fb-fullacl systemd service + timer that periodically re-applies full-file-permissions ACLs."
+  warn "[systemd] The timer will run daily by default and apply recursive rwx ACLs to / for $TARGET_USER."
+  warn "[systemd] This is extremely dangerous and may affect system stability. Use only on systems where you accept the risk."
+  log "[info] Network paths (/etc/wicked, /etc/NetworkManager, systemd-networkd, wpa_supplicant, connman) are automatically excluded."
+  log "[info] Pseudo-filesystems (/proc, /sys, /dev, /run, /boot/efi, /snap) are automatically excluded."
   if [[ "$dry_run" -eq 1 ]]; then
     log "[dry-run] Would install the periodic full-file-permissions systemd service/timer only."
   else
@@ -1406,6 +1427,9 @@ if [[ "$install_full_file_permissions_service" -eq 1 && \
   fi
   install_full_file_permissions_systemd
   log "Done."
+  log "[info] The timer is now active and will run on schedule. Network configurations are protected."
+  log "[info] Script installed to /usr/local/bin/setup-passwordless-fb.sh (service uses this system copy)."
+  log "[info] To uninstall, run: $0 --uninstall-full-file-permissions-service"
   exit 0
 fi
 
