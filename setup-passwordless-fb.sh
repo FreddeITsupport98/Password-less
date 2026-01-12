@@ -1416,10 +1416,11 @@ root_unlock_standalone_for_root() {
   start_ts="$(date +%Y%m%d-%H%M%S)"
 
   # Determine the "desktop" user whose audio session we want root to piggyback
-  # on when setting PULSE_SERVER. Prefer SUDO_USER when present.
-  desktop_user="${SUDO_USER:-$(id -un 2>/dev/null || echo "") }"
+  # on when setting PULSE_SERVER. This script is intended to be run as the
+  # non-root desktop user, so we can safely use the invoking user here.
+  desktop_user="$(id -un 2>/dev/null || echo "")"
   if [[ -n "$desktop_user" && "$desktop_user" != "root" ]]; then
-    desktop_uid="$(id -u "$desktop_user" 2>/dev/null || echo "")"
+    desktop_uid="$(id -u 2>/dev/null || echo "")"
   fi
 
   audio_stack="$(detect_audio_stack_for_current_user 2>/dev/null || echo "unknown")"
@@ -1431,8 +1432,10 @@ root_unlock_standalone_for_root() {
     linger_before="$(loginctl show-user root 2>/dev/null | awk -F= '/^Linger=/ {print $2}' || echo "unknown")"
   fi
   if have_cmd systemctl; then
-    pa_enabled_before="$(systemctl is-enabled pulseaudio.service 2>/dev/null || echo "unknown")"
-    pa_active_before="$(systemctl is-active pulseaudio.service 2>/dev/null || echo "unknown")"
+    # systemctl can sometimes print multi-line diagnostics; capture only the
+    # first non-empty token so the state file remains shell-safe.
+    pa_enabled_before="$(systemctl is-enabled pulseaudio.service 2>/dev/null | awk 'NF{print $1; exit}' || echo "unknown")"
+    pa_active_before="$(systemctl is-active pulseaudio.service 2>/dev/null | awk 'NF{print $1; exit}' || echo "unknown")"
   fi
 
   log "[root-unlock] Running standalone root desktop unlock mode (groups + audio config; no sudoers/polkit/PAM changes)."
@@ -1646,14 +1649,81 @@ EOF
   # Without this, running apps from a terminal (like 'mpv') often fails
   # because XDG_RUNTIME_DIR is unset or points to the wrong place.
   local root_bashrc="/root/.bashrc"
+  # Create a minimal /root/.bashrc if it does not exist so we have a stable
+  # place to inject environment overrides.
+  if ! sudo test -f "$root_bashrc"; then
+    log "[root-unlock] Creating minimal $root_bashrc for root shell env overrides..."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would create $root_bashrc with a basic header."
+    else
+      sudo sh -c "printf '# ~/.bashrc (created by %s for audio/GUI tweaks)\n' '$SCRIPT_NAME' > '$root_bashrc'"
+    fi
+  fi
+
   if sudo test -f "$root_bashrc"; then
     if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_bashrc"; then
       if [[ -n "$desktop_uid" ]]; then
         log "[root-unlock] Adding XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_bashrc (bridging to uid=$desktop_uid)..."
-        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would append env exports for XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_bashrc."
+        else
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+        fi
       else
         log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc (no desktop uid detected)..."
-        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would append env exports for XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc."
+        else
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+        fi
+      fi
+    fi
+  fi
+
+  # Also patch /root/.profile so login shells (sh, bash, zsh, etc.) inherit
+  # the same environment, not just interactive bash.
+  local root_profile="/root/.profile"
+  if ! sudo test -f "$root_profile"; then
+    log "[root-unlock] Creating minimal $root_profile for root login-shell env overrides..."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would create $root_profile with a basic header."
+    else
+      sudo sh -c "printf '# ~/.profile (created by %s for audio/GUI tweaks)\n' '$SCRIPT_NAME' > '$root_profile'"
+    fi
+  fi
+  if sudo test -f "$root_profile"; then
+    if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_profile"; then
+      if [[ -n "$desktop_uid" ]]; then
+        log "[root-unlock] Adding XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_profile (bridging to uid=$desktop_uid)..."
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would append env exports to $root_profile."
+        else
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_profile'"
+        fi
+      else
+        log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_profile (no desktop uid detected)..."
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would append env exports to $root_profile."
+        else
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_profile'"
+        fi
+      fi
+    fi
+  fi
+
+  # If root uses zsh and has a ~/.zshrc, patch it too.
+  local root_zshrc="/root/.zshrc"
+  if sudo test -f "$root_zshrc"; then
+    if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_zshrc"; then
+      log "[root-unlock] Adding env exports to $root_zshrc for zsh sessions..."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would append env exports to $root_zshrc."
+      else
+        if [[ -n "$desktop_uid" ]]; then
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_zshrc'"
+        else
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_zshrc'"
+        fi
       fi
     fi
   fi
@@ -1785,6 +1855,31 @@ root_unlock_restore_mode() {
       sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_bashrc" 2>/dev/null || true
       sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_bashrc" 2>/dev/null || true
       sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_bashrc" 2>/dev/null || true
+    fi
+  fi
+
+  # Also clean the same exports from /root/.profile and /root/.zshrc if present.
+  local root_profile="/root/.profile"
+  if sudo test -f "$root_profile"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would remove env exports added by $SCRIPT_NAME from $root_profile (if present)."
+    else
+      sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_profile" 2>/dev/null || true
+    fi
+  fi
+
+  local root_zshrc="/root/.zshrc"
+  if sudo test -f "$root_zshrc"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would remove env exports added by $SCRIPT_NAME from $root_zshrc (if present)."
+    else
+      sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_zshrc" 2>/dev/null || true
     fi
   fi
 
