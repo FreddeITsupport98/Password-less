@@ -1260,6 +1260,60 @@ configure_kdesu_for_sudo() {
   fi
 }
 
+maybe_unlock_root_account_for_gui() {
+  # Some distros ship with the root account "locked" (password field in
+  # /etc/shadow starts with '!' or '*'), which can prevent GUI or TTY logins
+  # from working even if everything else is configured correctly. For
+  # root-unlock usage, offer to unlock the root account so the user can log in
+  # as root if they explicitly want that.
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would inspect /etc/shadow to see if root's password field is locked ('!' or '*')."
+  fi
+
+  if ! sudo test -f /etc/shadow; then
+    log "[root-unlock] /etc/shadow not found; skipping root account lock check."
+    return 0
+  fi
+
+  local pw_field
+  pw_field="$(sudo awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null || echo "")"
+  if [[ -z "$pw_field" ]]; then
+    log "[root-unlock] Could not read root's password field from /etc/shadow; skipping lock check."
+    return 0
+  fi
+
+  # Consider the account "locked" if the field begins with '!' or '*' (common
+  # conventions across PAM implementations).
+  if [[ "$pw_field" != "!"* && "$pw_field" != "*"* ]]; then
+    log "[root-unlock] Root account does not appear locked in /etc/shadow; leaving as-is."
+    return 0
+  fi
+
+  warn "[root-unlock] Root account appears to be LOCKED in /etc/shadow (password field begins with '!' or '*')."
+  warn "[root-unlock] Unlocking root will allow direct root logins (TTY/GUI) in addition to sudo access. Use with care."
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would prompt to run: sudo passwd -u root (or sudo passwd root if needed)."
+    return 0
+  fi
+
+  if ! confirm "Unlock the root account now so that direct root logins are allowed?"; then
+    log "[root-unlock] Leaving root account locked at your request."
+    return 0
+  fi
+
+  # First try to simply unlock the account without changing the password hash.
+  if sudo passwd -u root; then
+    log "[root-unlock] Successfully unlocked root account via 'passwd -u root'."
+    return 0
+  fi
+
+  warn "[root-unlock] 'passwd -u root' failed; you may need to set a new root password manually."
+  warn "[root-unlock] You can run 'sudo passwd root' yourself later if you decide to set a password."
+
+  return 0
+}
+
 configure_pam_su_passwordless_for_wheel() {
   # Make 'su' passwordless for users in the 'wheel' group by adding 'trust'
   # to the pam_wheel.so line in the su PAM service config.
@@ -1441,6 +1495,10 @@ root_unlock_standalone_for_root() {
   log "[root-unlock] Running standalone root desktop unlock mode (groups + audio config; no sudoers/polkit/PAM changes)."
 
   require_sudo
+
+  # Optionally unlock the root account itself if it appears locked in
+  # /etc/shadow and the user explicitly confirms.
+  maybe_unlock_root_account_for_gui
 
   # [Improvement] Stop conflicting system-wide audio services that can fight
   # with per-user PulseAudio/PipeWire sessions.
