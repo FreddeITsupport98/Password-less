@@ -15,7 +15,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--root-unlock] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config]
 
 Options:
   --user USER                         Target USER (default: the invoking user running the script)
@@ -30,6 +30,7 @@ Options:
   --uninstall-full-file-permissions-service
                                      Remove the systemd service/timer and config installed by --install-full-file-permissions-service
   --default-config                    Reset /etc/passwordless-fb-fullacl.conf to its default template (ACL_TARGET_USER=current user, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)
+  --root-unlock                       Allow TARGET_USER=root (dangerous; lets this script modify the root account, including adding root to audio/network/etc groups)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
@@ -60,6 +61,7 @@ uninstall_full_file_permissions_service=0
 delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
 reset_fullacl_env_to_default=0
+allow_root_target=0  # When set via --root-unlock, run a standalone "root desktop unlock" mode.
 TARGET_USER=""
 POLKIT_TMP=""
 POLKIT_RULE_PATH=""
@@ -95,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --full-file-permissions)
       full_file_permissions=1
+      shift
+      ;;
+    --root-unlock)
+      allow_root_target=1
       shift
       ;;
     --all-groups)
@@ -1237,6 +1243,46 @@ configure_pam_su_passwordless_for_wheel() {
   # On some distros (e.g. openSUSE), the shipped config lives in /usr/lib/pam.d
   # and /etc/pam.d may not contain a service-specific file until overridden.
   local pam_su=""
+}
+
+root_unlock_standalone_for_root() {
+  # Standalone mode for --root-unlock: only tweak root's group memberships so a
+  # root GUI session has similar device/sound access as a normal user.
+  # No sudoers, polkit, PAM, or ACL changes are made here.
+  local root_user="root"
+
+  log "[root-unlock] Running standalone root desktop unlock mode (groups only; no sudoers/polkit/PAM changes)."
+
+  require_sudo
+
+  # Sanity check: root should always exist, but be explicit.
+  getent passwd "$root_user" >/dev/null 2>&1 || die "User 'root' does not exist (unexpected)."
+
+  # Desktop/device-related groups that normal users are often added to for sound,
+  # graphics, input, etc. We reuse roughly the same set as the main script.
+  local grp
+  for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem; do
+    # Skip groups that do not exist on this system.
+    if ! getent group "$grp" >/dev/null 2>&1; then
+      log "[root-unlock] Group $grp does not exist on this system; skipping."
+      continue
+    fi
+
+    log "[root-unlock] Ensuring $root_user is in $grp group..."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would run: sudo usermod -aG $grp $root_user"
+    else
+      if id -nG "$root_user" | grep -qw "$grp"; then
+        log "[root-unlock] $root_user is already in $grp group; skipping."
+      else
+        sudo usermod -aG "$grp" "$root_user"
+        log "[root-unlock] Added $root_user to $grp group. You may need to log out and back in to the root session for this to take effect."
+      fi
+    fi
+  done
+
+  log "[root-unlock] Done. Root's desktop/device group memberships have been updated. Log out of any root GUI session and log back in for changes to fully apply."
+}
   local tmp
   local inserted_new_line=0
 
@@ -1387,12 +1433,21 @@ if [[ -z "$TARGET_USER" ]]; then
   TARGET_USER="$(id -un)"
 fi
 
+# Standalone root-unlock mode: only tweak root's group memberships so a root
+# GUI session behaves more like a regular user for sound/devices. We do this
+# early and then exit without running the rest of the script.
+if [[ "$allow_root_target" -eq 1 ]]; then
+  TARGET_USER="root"
+  root_unlock_standalone_for_root
+  exit 0
+fi
+
 # Ensure target user exists.
 getent passwd "$TARGET_USER" >/dev/null 2>&1 || die "Target user '$TARGET_USER' does not exist (getent passwd failed)."
 
-# Hard stop if target is root.
+# Hard stop if target is root for the normal modes.
 if [[ "$TARGET_USER" == "root" ]]; then
-  die "Refusing to configure passwordless access for root."
+  die "Refusing to configure passwordless access for root. Use --root-unlock for the limited root desktop unlock mode instead."
 fi
 
 require_sudo
