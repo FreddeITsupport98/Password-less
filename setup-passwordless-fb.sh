@@ -1410,11 +1410,20 @@ root_unlock_standalone_for_root() {
   local pa_enabled_before="unknown"
   local pa_active_before="unknown"
   local start_ts
+  local desktop_user=""
+  local desktop_uid=""
 
   start_ts="$(date +%Y%m%d-%H%M%S)"
 
+  # Determine the "desktop" user whose audio session we want root to piggyback
+  # on when setting PULSE_SERVER. Prefer SUDO_USER when present.
+  desktop_user="${SUDO_USER:-$(id -un 2>/dev/null || echo "") }"
+  if [[ -n "$desktop_user" && "$desktop_user" != "root" ]]; then
+    desktop_uid="$(id -u "$desktop_user" 2>/dev/null || echo "")"
+  fi
+
   audio_stack="$(detect_audio_stack_for_current_user 2>/dev/null || echo "unknown")"
-  log "[root-unlock] Detected audio stack for current user: ${audio_stack:-unknown}"
+  log "[root-unlock] Detected audio stack for current user: ${audio_stack:-unknown} (desktop_user=${desktop_user:-unknown} uid=${desktop_uid:-?})"
 
   # Capture baseline state so --root-unlock-restore can later revert as closely
   # as possible to the previous configuration.
@@ -1639,8 +1648,13 @@ EOF
   local root_bashrc="/root/.bashrc"
   if sudo test -f "$root_bashrc"; then
     if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_bashrc"; then
-      log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc..."
-      sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+      if [[ -n "$desktop_uid" ]]; then
+        log "[root-unlock] Adding XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_bashrc (bridging to uid=$desktop_uid)..."
+        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+      else
+        log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc (no desktop uid detected)..."
+        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+      fi
     fi
   fi
 
@@ -1769,6 +1783,7 @@ root_unlock_restore_mode() {
     else
       sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_bashrc" 2>/dev/null || true
       sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_bashrc" 2>/dev/null || true
+      sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_bashrc" 2>/dev/null || true
       sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_bashrc" 2>/dev/null || true
     fi
   fi
