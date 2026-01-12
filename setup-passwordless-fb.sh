@@ -827,19 +827,41 @@ send_fullacl_notification() {
     sudo -u "$u" notify-send "$title" "$body" 2>/dev/null || true
   fi
 }
-
 # Detect which audio stack appears to be active for the *current* (non-root)
 # user. This is a best-effort heuristic used by root_unlock_standalone_for_root
-# to decide how aggressively to tweak PulseAudio/PipeWire state.
+# to decide how aggressively to tweak PulseAudio/PipeWire state. It tries a
+# mix of systemd user units and CLI probes so it works across multiple
+# distros (PipeWire, classic PulseAudio, or PulseAudio-on-PipeWire).
+
 detect_audio_stack_for_current_user() {
   local stack="unknown"
 
-  # PipeWire with PulseAudio compatibility shim
-  if have_cmd systemctl && systemctl --user is-active pipewire-pulse.service >/dev/null 2>&1; then
-    stack="pipewire-pulse"
-  # Classic PulseAudio (or PipeWire exposed purely as a Pulse server)
-  elif have_cmd pactl && pactl info >/dev/null 2>&1; then
-    stack="pulseaudio"
+  # Prefer systemd user units when available; they tend to be the most
+  # reliable cross-distro signal.
+  if have_cmd systemctl; then
+    if systemctl --user is-active pipewire-pulse.service >/dev/null 2>&1; then
+      stack="pipewire-pulse"
+    elif systemctl --user is-active pipewire.service >/dev/null 2>&1; then
+      stack="pipewire"
+    elif systemctl --user is-active pulseaudio.service >/dev/null 2>&1; then
+      stack="pulseaudio"
+    fi
+  fi
+
+  # Fallbacks when systemd user units are inactive or missing.
+  if [[ "$stack" == "unknown" ]]; then
+    if have_cmd pactl && pactl info >/dev/null 2>&1; then
+      # If pactl is talking to a PipeWire-backed Pulse server, the server
+      # string will usually mention PipeWire; we don't rely on that detail
+      # though and just treat it generically as "pulseaudio".
+      stack="pulseaudio"
+    elif have_cmd pgrep; then
+      if pgrep -u "$(id -u)" pipewire >/dev/null 2>&1; then
+        stack="pipewire"
+      elif pgrep -u "$(id -u)" pulseaudio >/dev/null 2>&1; then
+        stack="pulseaudio"
+      fi
+    fi
   fi
 
   printf '%s\n' "$stack"
@@ -1467,6 +1489,11 @@ root_unlock_standalone_for_root() {
   local desktop_user=""
   local desktop_uid=""
 
+  # In root-unlock mode we are adjusting a small, known set of config files
+  # that are safe to overwrite with backups; allow write_root_file to
+  # overwrite them without requiring a global --force flag.
+  force=1
+
   start_ts="$(date +%Y%m%d-%H%M%S)"
 
   # Determine the "desktop" user whose audio session we want root to piggyback
@@ -1545,9 +1572,7 @@ root_unlock_standalone_for_root() {
     log "[root-unlock] Skipping /etc/pulse/client.conf tweaks (audio stack '$audio_stack' does not look PulseAudio-compatible)."
   else
     if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would ensure allow-autospawn-for-root = yes and autospawn = yes in $pulse_client (backing up first if it exists)."
-    else
-      backup_if_exists "$pulse_client"
+      log "[dry-run] Would ensure allow-autospawn-for-root = yes and autospawn = yes in $pulse_client."
     fi
 
     if sudo test -e "$pulse_client"; then
@@ -1595,50 +1620,45 @@ EOF
   fi
   fi  # end PulseAudio compatibility guard
 
-  # 3) WirePlumber/PipeWire: best-effort support for root.
-  if have_cmd systemctl && [[ "$audio_stack" == "pipewire-pulse" || "$audio_stack" == "unknown" ]]; then
-    # Detect if any typical PipeWire/WirePlumber user units exist.
-    if systemctl list-unit-files wireplumber.service pipewire.service pipewire-pulse.service \
-         >/dev/null 2>&1; then
-      log "[root-unlock] Detected WirePlumber/PipeWire user services on this system."
-      if have_cmd loginctl; then
-        if [[ "$dry_run" -eq 1 ]]; then
-          log "[dry-run] Would run: sudo loginctl enable-linger root  # allow root to have a persistent systemd --user instance"
-        else
-          if sudo loginctl enable-linger root >/dev/null 2>&1; then
-            log "[root-unlock] Enabled linger for root so systemd --user (PipeWire/WirePlumber) can run for the root user."
-            linger_changed=1
+  # 3) WirePlumber/PipeWire: allow root to run its own user instance even on
+  # distros that ship user units with ConditionUser=!root (e.g. openSUSE).
+  if have_cmd systemctl; then
+    log "[root-unlock] Configuring PipeWire/WirePlumber user services for root..."
+    local root_systemd_user_dir="/root/.config/systemd/user"
+    local pw_dropin_dir="${root_systemd_user_dir}/pipewire.service.d"
+    local pw_pulse_dropin_dir="${root_systemd_user_dir}/pipewire-pulse.service.d"
 
-            # Force-start the relevant user services now so we don't have to
-            # wait for a reboot/new login. These are best-effort and may fail
-            # harmlessly if no user instance is active yet.
-          log "[root-unlock] Attempting to force-start PipeWire/WirePlumber for root via systemctl --user..."
-            # We explicitly set XDG_RUNTIME_DIR to ensure systemctl finds the
-            # root user's systemd --user instance.
-            sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would create drop-ins in $pw_dropin_dir and $pw_pulse_dropin_dir to clear ConditionUser=!root for PipeWire units."
+    else
+      sudo mkdir -p "$pw_dropin_dir" "$pw_pulse_dropin_dir"
+      local tmp_pw
+      tmp_pw="$(mktemp)"
+      cat >"$tmp_pw" <<EOF
+[Unit]
+ConditionUser=
+EOF
+      write_root_file "$tmp_pw" "${pw_dropin_dir}/10-allow-root.conf" 0644
+      write_root_file "$tmp_pw" "${pw_pulse_dropin_dir}/10-allow-root.conf" 0644
+      rm -f "$tmp_pw" 2>/dev/null || true
+      log "[root-unlock] Installed PipeWire drop-ins to allow root user units to start."
+    fi
 
-            # Only restart/enable units that actually exist for the root user.
-            local svc
-            local restart_units=()
-            for svc in wireplumber.service pipewire.service pipewire-pulse.service; do
-              if sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user list-unit-files "$svc" >/dev/null 2>&1; then
-                restart_units+=("$svc")
-              fi
-            done
-            if ((${#restart_units[@]})); then
-              # Ensure the units are enabled and started now so they persist
-              # beyond this session.
-              sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user enable --now "${restart_units[@]}" >/dev/null 2>&1 || true
-            fi
-          else
-            warn "[root-unlock] Failed to enable linger for root via loginctl; root's systemd --user audio services may not start automatically."
-          fi
-        fi
+    if have_cmd loginctl; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: sudo loginctl enable-linger root and start PipeWire/WirePlumber user services for root."
       else
-        log "[root-unlock] loginctl not found; cannot automatically enable linger for root. Root's systemd --user audio services may still require an active login session."
+        if sudo loginctl enable-linger root >/dev/null 2>&1; then
+          log "[root-unlock] Enabled linger for root so systemd --user audio services can run."
+          linger_changed=1
+        fi
+        # Best-effort reload + enable+start user units for root.
+        sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user daemon-reload >/dev/null 2>&1 || true
+        sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user enable --now pipewire.socket pipewire-pulse.socket >/dev/null 2>&1 || true
+        sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user enable --now pipewire.service pipewire-pulse.service wireplumber.service >/dev/null 2>&1 || true
       fi
     else
-      log "[root-unlock] No WirePlumber/PipeWire user units reported by systemctl; skipping systemd --user tweaks."
+      log "[root-unlock] loginctl not found; cannot enable linger for root automatically."
     fi
   else
     log "[root-unlock] systemctl not found; skipping WirePlumber/PipeWire systemd --user tweaks."
@@ -1720,20 +1740,11 @@ EOF
 
   if sudo test -f "$root_bashrc"; then
     if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_bashrc"; then
-      if [[ -n "$desktop_uid" ]]; then
-        log "[root-unlock] Adding XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_bashrc (bridging to uid=$desktop_uid)..."
-        if [[ "$dry_run" -eq 1 ]]; then
-          log "[dry-run] Would append env exports for XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_bashrc."
-        else
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
-        fi
+      log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc for root shells..."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would append env exports for XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc."
       else
-        log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc (no desktop uid detected)..."
-        if [[ "$dry_run" -eq 1 ]]; then
-          log "[dry-run] Would append env exports for XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc."
-        else
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
-        fi
+        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$root_bashrc'"
       fi
     fi
   fi
@@ -1746,27 +1757,38 @@ EOF
     if [[ "$dry_run" -eq 1 ]]; then
       log "[dry-run] Would create $root_profile with a basic header."
     else
-      sudo sh -c "printf '# ~/.profile (created by %s for audio/GUI tweaks)\n' '$SCRIPT_NAME' > '$root_profile'"
+      sudo sh -c "printf '# ~/.profile (created by %s for audio/GUI tweaks)\\n' '$SCRIPT_NAME' > '$root_profile'"
     fi
   fi
   if sudo test -f "$root_profile"; then
     if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_profile"; then
-      if [[ -n "$desktop_uid" ]]; then
-        log "[root-unlock] Adding XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and PULSE_SERVER to $root_profile (bridging to uid=$desktop_uid)..."
-        if [[ "$dry_run" -eq 1 ]]; then
-          log "[dry-run] Would append env exports to $root_profile."
-        else
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_profile'"
-        fi
+      log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_profile for login shells..."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would append env exports to $root_profile."
       else
-        log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_profile (no desktop uid detected)..."
-        if [[ "$dry_run" -eq 1 ]]; then
-          log "[dry-run] Would append env exports to $root_profile."
-        else
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_profile'"
-        fi
+        sudo sh -c "printf '\\n# Added by %s for audio/GUI fix\\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$root_profile'"
       fi
     fi
+  fi
+
+  # Also write a systemd-style environment.d snippet so GUI sessions that
+  # don't read shell rc files still get the right audio variables.
+  local root_envd="/root/.config/environment.d"
+  local root_envd_file="$root_envd/passwordless-fb-root-audio.conf"
+  log "[root-unlock] Ensuring $root_envd_file exists for GUI env overrides..."
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would create $root_envd_file with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS."
+  else
+    sudo mkdir -p "$root_envd"
+    local tmp_envd
+    tmp_envd="$(mktemp)"
+    cat >"$tmp_envd" <<EOF
+# Generated by $SCRIPT_NAME for root desktop audio
+XDG_RUNTIME_DIR=/run/user/0
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+EOF
+    write_root_file "$tmp_envd" "$root_envd_file" 0644
+    rm -f "$tmp_envd" 2>/dev/null || true
   fi
 
   # If root uses zsh and has a ~/.zshrc, patch it too.
@@ -1777,11 +1799,7 @@ EOF
       if [[ "$dry_run" -eq 1 ]]; then
         log "[dry-run] Would append env exports to $root_zshrc."
       else
-        if [[ -n "$desktop_uid" ]]; then
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\nexport PULSE_SERVER=\${PULSE_SERVER:-unix:/run/user/$desktop_uid/pulse/native}\n' '$SCRIPT_NAME' >> '$root_zshrc'"
-        else
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_zshrc'"
-        fi
+        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$root_zshrc'"
       fi
     fi
   fi
@@ -1922,10 +1940,10 @@ root_unlock_restore_mode() {
     if [[ "$dry_run" -eq 1 ]]; then
       log "[dry-run] Would remove env exports added by $SCRIPT_NAME from $root_profile (if present)."
     else
-      sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_profile" 2>/dev/null || true
-      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_profile" 2>/dev/null || true
-      sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_profile" 2>/dev/null || true
-      sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/export XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-\\/run\\/user\\/0}/d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\\/run\\/user\\/0\\/bus}/d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/export PULSE_SERVER=\\${PULSE_SERVER:-unix:\\/run\\/user\\//d' "$root_profile" 2>/dev/null || true
+      sudo sed -i '/# Added by .* for audio\\/GUI fix$/d' "$root_profile" 2>/dev/null || true
     fi
   fi
 
@@ -1934,10 +1952,34 @@ root_unlock_restore_mode() {
     if [[ "$dry_run" -eq 1 ]]; then
       log "[dry-run] Would remove env exports added by $SCRIPT_NAME from $root_zshrc (if present)."
     else
-      sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_zshrc" 2>/dev/null || true
-      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_zshrc" 2>/dev/null || true
-      sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_zshrc" 2>/dev/null || true
-      sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/export XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-\\/run\\/user\\/0}/d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\\/run\\/user\\/0\\/bus}/d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/export PULSE_SERVER=\\${PULSE_SERVER:-unix:\\/run\\/user\\//d' "$root_zshrc" 2>/dev/null || true
+      sudo sed -i '/# Added by .* for audio\\/GUI fix$/d' "$root_zshrc" 2>/dev/null || true
+    fi
+  fi
+
+  # Remove environment.d snippet created for GUI sessions.
+  local root_envd_file="/root/.config/environment.d/passwordless-fb-root-audio.conf"
+  if sudo test -f "$root_envd_file"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would remove $root_envd_file created by $SCRIPT_NAME."
+    else
+      sudo rm -f "$root_envd_file" 2>/dev/null || true
+    fi
+  fi
+
+  # Remove PipeWire drop-ins created for root by --root-unlock (if present).
+  local root_systemd_user_dir="/root/.config/systemd/user"
+  if sudo test -d "$root_systemd_user_dir"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would remove PipeWire drop-ins under $root_systemd_user_dir created by $SCRIPT_NAME (if present)."
+    else
+      sudo rm -f "$root_systemd_user_dir"/pipewire.service.d/10-allow-root.conf \
+                "$root_systemd_user_dir"/pipewire-pulse.service.d/10-allow-root.conf 2>/dev/null || true
+      if have_cmd systemctl; then
+        sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user daemon-reload >/dev/null 2>&1 || true
+      fi
     fi
   fi
 
