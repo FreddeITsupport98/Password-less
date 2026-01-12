@@ -30,7 +30,7 @@ Options:
   --uninstall-full-file-permissions-service
                                      Remove the systemd service/timer and config installed by --install-full-file-permissions-service
   --default-config                    Reset /etc/passwordless-fb-fullacl.conf to its default template (ACL_TARGET_USER=current user, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)
-  --root-unlock                       Allow TARGET_USER=root (dangerous; lets this script modify the root account, including adding root to audio/network/etc groups)
+  --root-unlock                       Standalone "root desktop unlock" mode: tweak root's audio/device groups and PulseAudio/PipeWire settings (no sudoers/polkit/PAM changes)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
@@ -1243,46 +1243,6 @@ configure_pam_su_passwordless_for_wheel() {
   # On some distros (e.g. openSUSE), the shipped config lives in /usr/lib/pam.d
   # and /etc/pam.d may not contain a service-specific file until overridden.
   local pam_su=""
-}
-
-root_unlock_standalone_for_root() {
-  # Standalone mode for --root-unlock: only tweak root's group memberships so a
-  # root GUI session has similar device/sound access as a normal user.
-  # No sudoers, polkit, PAM, or ACL changes are made here.
-  local root_user="root"
-
-  log "[root-unlock] Running standalone root desktop unlock mode (groups only; no sudoers/polkit/PAM changes)."
-
-  require_sudo
-
-  # Sanity check: root should always exist, but be explicit.
-  getent passwd "$root_user" >/dev/null 2>&1 || die "User 'root' does not exist (unexpected)."
-
-  # Desktop/device-related groups that normal users are often added to for sound,
-  # graphics, input, etc. We reuse roughly the same set as the main script.
-  local grp
-  for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem; do
-    # Skip groups that do not exist on this system.
-    if ! getent group "$grp" >/dev/null 2>&1; then
-      log "[root-unlock] Group $grp does not exist on this system; skipping."
-      continue
-    fi
-
-    log "[root-unlock] Ensuring $root_user is in $grp group..."
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would run: sudo usermod -aG $grp $root_user"
-    else
-      if id -nG "$root_user" | grep -qw "$grp"; then
-        log "[root-unlock] $root_user is already in $grp group; skipping."
-      else
-        sudo usermod -aG "$grp" "$root_user"
-        log "[root-unlock] Added $root_user to $grp group. You may need to log out and back in to the root session for this to take effect."
-      fi
-    fi
-  done
-
-  log "[root-unlock] Done. Root's desktop/device group memberships have been updated. Log out of any root GUI session and log back in for changes to fully apply."
-}
   local tmp
   local inserted_new_line=0
 
@@ -1410,6 +1370,111 @@ root_unlock_standalone_for_root() {
   rm -f "$tmp"
 
   log "[info] Updated $pam_su to allow passwordless su for users in the wheel group."
+}
+
+root_unlock_standalone_for_root() {
+  # Standalone mode for --root-unlock: tweak root's group memberships and a few
+  # audio-related settings so a root GUI session has similar device/sound
+  # access as a normal user. No sudoers, polkit, PAM, or ACL changes are made
+  # here.
+  local root_user="root"
+
+  log "[root-unlock] Running standalone root desktop unlock mode (groups + audio config; no sudoers/polkit/PAM changes)."
+
+  require_sudo
+
+  # Sanity check: root should always exist, but be explicit.
+  getent passwd "$root_user" >/dev/null 2>&1 || die "User 'root' does not exist (unexpected)."
+
+  # 1) Desktop/device-related groups: sound, graphics, input, etc.
+  local grp
+  for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem; do
+    # Skip groups that do not exist on this system.
+    if ! getent group "$grp" >/dev/null 2>&1; then
+      log "[root-unlock] Group $grp does not exist on this system; skipping."
+      continue
+    fi
+
+    log "[root-unlock] Ensuring $root_user is in $grp group..."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would run: sudo usermod -aG $grp $root_user"
+    else
+      if id -nG "$root_user" | grep -qw "$grp"; then
+        log "[root-unlock] $root_user is already in $grp group; skipping."
+      else
+        sudo usermod -aG "$grp" "$root_user"
+        log "[root-unlock] Added $root_user to $grp group. You may need to log out and back in to the root session for this to take effect."
+      fi
+    fi
+  done
+
+  # 2) PulseAudio: allow root to autospawn its own server.
+  local pulse_client="/etc/pulse/client.conf"
+  local tmp_pulse
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would ensure allow-autospawn-for-root = yes in $pulse_client (backing up first if it exists)."
+  else
+    backup_if_exists "$pulse_client"
+  fi
+
+  if sudo test -e "$pulse_client"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      : # already logged above
+    else
+      # If the key exists (commented or not), normalize it; otherwise append.
+      if sudo grep -Eq '^[[:space:]]*allow-autospawn-for-root' "$pulse_client"; then
+        sudo sed -i 's/^[[:space:]]*allow-autospawn-for-root.*/allow-autospawn-for-root = yes/' "$pulse_client" || \
+          warn "[root-unlock] Failed to update allow-autospawn-for-root in $pulse_client via sed."
+      else
+        sudo sh -c "printf '\n# Added by %s for root desktop audio\nallow-autospawn-for-root = yes\n' '$SCRIPT_NAME' >> '$pulse_client'" || \
+          warn "[root-unlock] Failed to append allow-autospawn-for-root entry to $pulse_client."
+      fi
+      log "[root-unlock] Ensured allow-autospawn-for-root = yes in $pulse_client."
+    fi
+  else
+    # No client.conf: create a minimal one.
+    tmp_pulse="$(mktemp)"
+    cat >"$tmp_pulse" <<EOF
+# Generated by $SCRIPT_NAME for root desktop audio
+allow-autospawn-for-root = yes
+EOF
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would install new $pulse_client with allow-autospawn-for-root = yes."
+    else
+      write_root_file "$tmp_pulse" "$pulse_client" 0644
+      log "[root-unlock] Created $pulse_client with allow-autospawn-for-root = yes."
+    fi
+    rm -f "$tmp_pulse" 2>/dev/null || true
+  fi
+
+  # 3) WirePlumber/PipeWire: best-effort systemd --user support for root.
+  if have_cmd systemctl; then
+    # Detect if any typical PipeWire/WirePlumber user units exist.
+    if systemctl list-unit-files wireplumber.service pipewire.service pipewire-pulse.service \
+         >/dev/null 2>&1; then
+      log "[root-unlock] Detected WirePlumber/PipeWire user services on this system."
+      if have_cmd loginctl; then
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would run: sudo loginctl enable-linger root  # allow root to have a persistent systemd --user instance"
+        else
+          if sudo loginctl enable-linger root >/dev/null 2>&1; then
+            log "[root-unlock] Enabled linger for root so systemd --user (PipeWire/WirePlumber) can run for the root user."
+          else
+            warn "[root-unlock] Failed to enable linger for root via loginctl; root's systemd --user audio services may not start automatically."
+          fi
+        fi
+      else
+        log "[root-unlock] loginctl not found; cannot automatically enable linger for root. Root's systemd --user audio services may still require an active login session."
+      fi
+    else
+      log "[root-unlock] No WirePlumber/PipeWire user units reported by systemctl; skipping systemd --user tweaks."
+    fi
+  else
+    log "[root-unlock] systemctl not found; skipping WirePlumber/PipeWire systemd --user tweaks."
+  fi
+
+  log "[root-unlock] Done. Root's desktop/device groups and basic audio settings have been updated. Log out of any root GUI session and log back in for changes to fully apply."
 }
 
 # --- Sanity checks ---
