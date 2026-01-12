@@ -31,6 +31,7 @@ Options:
                                      Remove the systemd service/timer and config installed by --install-full-file-permissions-service
   --default-config                    Reset /etc/passwordless-fb-fullacl.conf to its default template (ACL_TARGET_USER=current user, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)
   --root-unlock                       Standalone "root desktop unlock" mode: tweak root's audio/device groups and PulseAudio/PipeWire settings (no sudoers/polkit/PAM changes)
+  --root-unlock-restore               Attempt to undo root-unlock changes (restore /etc/pulse/client.conf backup, disable linger, show root's desktop/audio groups)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
@@ -62,6 +63,7 @@ delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
 reset_fullacl_env_to_default=0
 allow_root_target=0  # When set via --root-unlock, run a standalone "root desktop unlock" mode.
+root_unlock_restore=0
 TARGET_USER=""
 POLKIT_TMP=""
 POLKIT_RULE_PATH=""
@@ -117,6 +119,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --default-config|--defualt-config)
       reset_fullacl_env_to_default=1
+      shift
+      ;;
+    --root-unlock-restore)
+      root_unlock_restore=1
       shift
       ;;
     --delete-passwd-on-polkit-fail)
@@ -822,6 +828,23 @@ send_fullacl_notification() {
   fi
 }
 
+# Detect which audio stack appears to be active for the *current* (non-root)
+# user. This is a best-effort heuristic used by root_unlock_standalone_for_root
+# to decide how aggressively to tweak PulseAudio/PipeWire state.
+detect_audio_stack_for_current_user() {
+  local stack="unknown"
+
+  # PipeWire with PulseAudio compatibility shim
+  if have_cmd systemctl && systemctl --user is-active pipewire-pulse.service >/dev/null 2>&1; then
+    stack="pipewire-pulse"
+  # Classic PulseAudio (or PipeWire exposed purely as a Pulse server)
+  elif have_cmd pactl && pactl info >/dev/null 2>&1; then
+    stack="pulseaudio"
+  fi
+
+  printf '%s\n' "$stack"
+}
+
 configure_full_file_permissions() {
   # Give TARGET_USER recursive rwx ACLs on the root filesystem (/).
   # This is equivalent in practice to full system compromise for that user.
@@ -1378,17 +1401,51 @@ root_unlock_standalone_for_root() {
   # access as a normal user. No sudoers, polkit, PAM, or ACL changes are made
   # here.
   local root_user="root"
+  local pulse_changed=0
+  local linger_changed=0
+  local configs_moved=0
+  local added_groups=()
+  local audio_stack
+  local linger_before="unknown"
+  local pa_enabled_before="unknown"
+  local pa_active_before="unknown"
+  local start_ts
+
+  start_ts="$(date +%Y%m%d-%H%M%S)"
+
+  audio_stack="$(detect_audio_stack_for_current_user 2>/dev/null || echo "unknown")"
+  log "[root-unlock] Detected audio stack for current user: ${audio_stack:-unknown}"
+
+  # Capture baseline state so --root-unlock-restore can later revert as closely
+  # as possible to the previous configuration.
+  if have_cmd loginctl; then
+    linger_before="$(loginctl show-user root 2>/dev/null | awk -F= '/^Linger=/ {print $2}' || echo "unknown")"
+  fi
+  if have_cmd systemctl; then
+    pa_enabled_before="$(systemctl is-enabled pulseaudio.service 2>/dev/null || echo "unknown")"
+    pa_active_before="$(systemctl is-active pulseaudio.service 2>/dev/null || echo "unknown")"
+  fi
 
   log "[root-unlock] Running standalone root desktop unlock mode (groups + audio config; no sudoers/polkit/PAM changes)."
 
   require_sudo
+
+  # [Improvement] Stop conflicting system-wide audio services that can fight
+  # with per-user PulseAudio/PipeWire sessions.
+  if have_cmd systemctl; then
+    if systemctl is-active --quiet pulseaudio.service 2>/dev/null; then
+      log "[root-unlock] Stopping conflicting system-wide pulseaudio.service..."
+      sudo systemctl stop pulseaudio.service >/dev/null 2>&1 || true
+      sudo systemctl disable pulseaudio.service >/dev/null 2>&1 || true
+    fi
+  fi
 
   # Sanity check: root should always exist, but be explicit.
   getent passwd "$root_user" >/dev/null 2>&1 || die "User 'root' does not exist (unexpected)."
 
   # 1) Desktop/device-related groups: sound, graphics, input, etc.
   local grp
-  for grp in root disk wheel systemd-journal network video audio input render kvm tty tape shadow kmem; do
+  for grp in root disk wheel systemd-journal network video audio pulse-access input render kvm tty tape shadow kmem; do
     # Skip groups that do not exist on this system.
     if ! getent group "$grp" >/dev/null 2>&1; then
       log "[root-unlock] Group $grp does not exist on this system; skipping."
@@ -1403,22 +1460,27 @@ root_unlock_standalone_for_root() {
         log "[root-unlock] $root_user is already in $grp group; skipping."
       else
         sudo usermod -aG "$grp" "$root_user"
+        added_groups+=("$grp")
         log "[root-unlock] Added $root_user to $grp group. You may need to log out and back in to the root session for this to take effect."
       fi
     fi
   done
 
-  # 2) PulseAudio: allow root to autospawn its own server.
+  # 2) PulseAudio: allow root to autospawn its own server. Only do this when
+  # the audio stack appears to be PulseAudio-compatible.
   local pulse_client="/etc/pulse/client.conf"
   local tmp_pulse
 
-  if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would ensure allow-autospawn-for-root = yes in $pulse_client (backing up first if it exists)."
+  if [[ "$audio_stack" != "pulseaudio" && "$audio_stack" != "pipewire-pulse" && "$audio_stack" != "unknown" ]]; then
+    log "[root-unlock] Skipping /etc/pulse/client.conf tweaks (audio stack '$audio_stack' does not look PulseAudio-compatible)."
   else
-    backup_if_exists "$pulse_client"
-  fi
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would ensure allow-autospawn-for-root = yes and autospawn = yes in $pulse_client (backing up first if it exists)."
+    else
+      backup_if_exists "$pulse_client"
+    fi
 
-  if sudo test -e "$pulse_client"; then
+    if sudo test -e "$pulse_client"; then
     if [[ "$dry_run" -eq 1 ]]; then
       : # already logged above
     else
@@ -1430,26 +1492,41 @@ root_unlock_standalone_for_root() {
         sudo sh -c "printf '\n# Added by %s for root desktop audio\nallow-autospawn-for-root = yes\n' '$SCRIPT_NAME' >> '$pulse_client'" || \
           warn "[root-unlock] Failed to append allow-autospawn-for-root entry to $pulse_client."
       fi
-      log "[root-unlock] Ensured allow-autospawn-for-root = yes in $pulse_client."
+
+      # Also ensure the global autospawn switch is enabled so the setting above
+      # actually takes effect.
+      if sudo grep -Eq '^[[:space:]]*autospawn' "$pulse_client"; then
+        sudo sed -i 's/^[[:space:]]*autospawn.*/autospawn = yes/' "$pulse_client" || \
+          warn "[root-unlock] Failed to update autospawn = yes in $pulse_client via sed."
+      else
+        sudo sh -c "echo 'autospawn = yes' >> '$pulse_client'" || \
+          warn "[root-unlock] Failed to append autospawn = yes to $pulse_client."
+      fi
+
+      log "[root-unlock] Ensured allow-autospawn-for-root = yes and autospawn = yes in $pulse_client."
+      pulse_changed=1
     fi
   else
     # No client.conf: create a minimal one.
     tmp_pulse="$(mktemp)"
     cat >"$tmp_pulse" <<EOF
 # Generated by $SCRIPT_NAME for root desktop audio
+autospawn = yes
 allow-autospawn-for-root = yes
 EOF
     if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would install new $pulse_client with allow-autospawn-for-root = yes."
+      log "[dry-run] Would install new $pulse_client with autospawn = yes and allow-autospawn-for-root = yes."
     else
       write_root_file "$tmp_pulse" "$pulse_client" 0644
-      log "[root-unlock] Created $pulse_client with allow-autospawn-for-root = yes."
+      log "[root-unlock] Created $pulse_client with autospawn = yes and allow-autospawn-for-root = yes."
     fi
     rm -f "$tmp_pulse" 2>/dev/null || true
+    pulse_changed=1
   fi
+  fi  # end PulseAudio compatibility guard
 
-  # 3) WirePlumber/PipeWire: best-effort systemd --user support for root.
-  if have_cmd systemctl; then
+  # 3) WirePlumber/PipeWire: best-effort support for root.
+  if have_cmd systemctl && [[ "$audio_stack" == "pipewire-pulse" || "$audio_stack" == "unknown" ]]; then
     # Detect if any typical PipeWire/WirePlumber user units exist.
     if systemctl list-unit-files wireplumber.service pipewire.service pipewire-pulse.service \
          >/dev/null 2>&1; then
@@ -1460,6 +1537,29 @@ EOF
         else
           if sudo loginctl enable-linger root >/dev/null 2>&1; then
             log "[root-unlock] Enabled linger for root so systemd --user (PipeWire/WirePlumber) can run for the root user."
+            linger_changed=1
+
+            # Force-start the relevant user services now so we don't have to
+            # wait for a reboot/new login. These are best-effort and may fail
+            # harmlessly if no user instance is active yet.
+          log "[root-unlock] Attempting to force-start PipeWire/WirePlumber for root via systemctl --user..."
+            # We explicitly set XDG_RUNTIME_DIR to ensure systemctl finds the
+            # root user's systemd --user instance.
+            sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+            # Only restart/enable units that actually exist for the root user.
+            local svc
+            local restart_units=()
+            for svc in wireplumber.service pipewire.service pipewire-pulse.service; do
+              if sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user list-unit-files "$svc" >/dev/null 2>&1; then
+                restart_units+=("$svc")
+              fi
+            done
+            if ((${#restart_units[@]})); then
+              # Ensure the units are enabled and started now so they persist
+              # beyond this session.
+              sudo -u root XDG_RUNTIME_DIR=/run/user/0 systemctl --user enable --now "${restart_units[@]}" >/dev/null 2>&1 || true
+            fi
           else
             warn "[root-unlock] Failed to enable linger for root via loginctl; root's systemd --user audio services may not start automatically."
           fi
@@ -1474,7 +1574,224 @@ EOF
     log "[root-unlock] systemctl not found; skipping WirePlumber/PipeWire systemd --user tweaks."
   fi
 
+  # 4) Clear stale per-user audio configs/cookies that can block new servers
+  # from starting cleanly.
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would move /root/.config/pulse /root/.config/pipewire /root/.local/state/wireplumber to *.bak.TIMESTAMP to clear stale audio configuration."
+  else
+    log "[root-unlock] Clearing stale audio configuration/cookies for root (moving to backups)..."
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    local p
+    for p in /root/.config/pulse /root/.config/pipewire /root/.local/state/wireplumber; do
+      if sudo test -e "$p"; then
+        local bak="${p}.bak.${ts}"
+        sudo mv "$p" "$bak" 2>/dev/null || true
+        log "[root-unlock] Moved $p -> $bak"
+        configs_moved=1
+      fi
+    done
+  fi
+
+  # Summary
+  if ((${#added_groups[@]})); then
+    log "[root-unlock] Groups added for root in this run: ${added_groups[*]}"
+  else
+    log "[root-unlock] No new groups were added for root in this run."
+  fi
+  if [[ "$pulse_changed" -eq 1 ]]; then
+    log "[root-unlock] PulseAudio client configuration was updated."
+  else
+    log "[root-unlock] PulseAudio client configuration did not need changes."
+  fi
+  if [[ "$linger_changed" -eq 1 ]]; then
+    log "[root-unlock] Linger was enabled for root (so systemd --user audio services can run)."
+  else
+    log "[root-unlock] Linger state for root was left unchanged."
+  fi
+  if [[ "$configs_moved" -eq 1 ]]; then
+    log "[root-unlock] Stale audio configuration/state was moved aside under *.bak.TIMESTAMP."
+  else
+    log "[root-unlock] No existing audio configuration/state directories were found under /root to move."
+  fi
+
+  # Persist state for future --root-unlock-restore runs.
+  local state_path="/etc/passwordless-fb-root-unlock.state"
+  local tmp_state
+  tmp_state="$(mktemp)"
+  {
+    printf '# Generated by %s --root-unlock\n' "$SCRIPT_NAME"
+    printf 'ROOT_UNLOCK_VERSION=1\n'
+    printf 'START_TS=%s\n' "${start_ts:-unknown}"
+    printf 'LAST_RUN_TS=%s\n' "$(date +%Y%m%d-%H%M%S)"
+    printf 'LINGER_BEFORE=%s\n' "${linger_before:-unknown}"
+    printf 'PA_ENABLED_BEFORE=%s\n' "${pa_enabled_before:-unknown}"
+    printf 'PA_ACTIVE_BEFORE=%s\n' "${pa_active_before:-unknown}"
+    printf 'ADDED_GROUPS="%s"\n' "${added_groups[*]}"
+  } >"$tmp_state"
+  write_root_file "$tmp_state" "$state_path" 0644
+  rm -f "$tmp_state" 2>/dev/null || true
+  log "[root-unlock] Wrote state file $state_path for future --root-unlock-restore runs."
+
+  # [Improvement] Ensure root shells know where the audio server is.
+  # Without this, running apps from a terminal (like 'mpv') often fails
+  # because XDG_RUNTIME_DIR is unset or points to the wrong place.
+  local root_bashrc="/root/.bashrc"
+  if sudo test -f "$root_bashrc"; then
+    if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_bashrc"; then
+      log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc..."
+      sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/0}\nexport DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+    fi
+  fi
+
+  # [Improvement] Force-unmute hardware ALSA channels.
+  if have_cmd amixer; then
+    log "[root-unlock] Unmuting hardware Master/PCM channels via amixer..."
+    sudo amixer set Master unmute >/dev/null 2>&1 || true
+    sudo amixer set Master 100%   >/dev/null 2>&1 || true
+    sudo amixer set PCM    unmute >/dev/null 2>&1 || true
+    sudo amixer set PCM    100%   >/dev/null 2>&1 || true
+    # [Improvement] Save these volume settings so they survive a reboot.
+    if have_cmd alsactl; then
+      sudo alsactl store >/dev/null 2>&1 || true
+    fi
+  fi
+
   log "[root-unlock] Done. Root's desktop/device groups and basic audio settings have been updated. Log out of any root GUI session and log back in for changes to fully apply."
+}
+
+# Dedicated restore path for root-unlock tweaks. This runs before the main
+# sanity checks and never touches sudoers/polkit/PAM.
+root_unlock_restore_mode() {
+  log "[root-unlock-restore] Attempting to restore root desktop unlock changes..."
+
+  require_sudo
+
+  local state_path="/etc/passwordless-fb-root-unlock.state"
+  # Defaults if no state file is present or readable.
+  local START_TS=""
+  local LINGER_BEFORE=""
+  local PA_ENABLED_BEFORE=""
+  local PA_ACTIVE_BEFORE=""
+  local ADDED_GROUPS=""
+
+  if [[ -r "$state_path" ]]; then
+    log "[root-unlock-restore] Loading state from $state_path..."
+    # shellcheck disable=SC1090
+    set +u
+    . "$state_path" || true
+    set -u
+  else
+    log "[root-unlock-restore] No state file found at $state_path; falling back to best-effort restore."
+  fi
+
+  # 1) Restore /etc/pulse/client.conf from the latest backup, if any.
+  local pulse_client="/etc/pulse/client.conf"
+  restore_latest_backup_for "$pulse_client"
+
+  # Also attempt to restore per-user audio config/state trees from their most
+  # recent *.bak.TIMESTAMP backups.
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would look for *.bak.* backups of /root/.config/pulse, /root/.config/pipewire, /root/.local/state/wireplumber and move them back into place."
+  else
+    local p latest
+    for p in /root/.config/pulse /root/.config/pipewire /root/.local/state/wireplumber; do
+      latest="$(ls -1dt "${p}.bak."* 2>/dev/null | head -n1 || true)"
+      if [[ -n "$latest" ]]; then
+        log "[root-unlock-restore] Restoring $p from backup $latest..."
+        sudo rm -rf "$p" 2>/dev/null || true
+        sudo mv "$latest" "$p" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # 2) Restore linger state for root based on the recorded value, if present.
+  if have_cmd loginctl; then
+    local cur_linger
+    cur_linger="$(loginctl show-user root 2>/dev/null | awk -F= '/^Linger=/ {print $2}' || echo "unknown")"
+    local target_linger="${LINGER_BEFORE:-}"  # from state file
+
+    if [[ -n "$target_linger" && "$target_linger" != "unknown" ]]; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would set linger for root back to '$target_linger' (current=$cur_linger)."
+      else
+        if [[ "$target_linger" == "yes" ]]; then
+          sudo loginctl enable-linger root >/dev/null 2>&1 || true
+          log "[root-unlock-restore] Ensured linger is ENABLED for root (as before)."
+        elif [[ "$target_linger" == "no" ]]; then
+          sudo loginctl disable-linger root >/dev/null 2>&1 || true
+          log "[root-unlock-restore] Ensured linger is DISABLED for root (as before)."
+        fi
+      fi
+    else
+      log "[root-unlock-restore] No prior linger state recorded; leaving current linger=${cur_linger}."
+    fi
+  else
+    log "[root-unlock-restore] loginctl not found; skipping linger restore."
+  fi
+
+  # 3) Restore system-wide pulseaudio.service enable/active state if we
+  # recorded it when --root-unlock last ran.
+  if have_cmd systemctl; then
+    if [[ -n "${PA_ENABLED_BEFORE:-}" && "${PA_ENABLED_BEFORE}" != "unknown" ]]; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would set pulseaudio.service enable state back to '${PA_ENABLED_BEFORE}'."
+      else
+        if [[ "$PA_ENABLED_BEFORE" == "enabled" ]]; then
+          sudo systemctl enable pulseaudio.service >/dev/null 2>&1 || true
+        elif [[ "$PA_ENABLED_BEFORE" == "disabled" ]]; then
+          sudo systemctl disable pulseaudio.service >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+
+    if [[ -n "${PA_ACTIVE_BEFORE:-}" && "${PA_ACTIVE_BEFORE}" != "unknown" ]]; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would set pulseaudio.service active state back to '${PA_ACTIVE_BEFORE}'."
+      else
+        if [[ "$PA_ACTIVE_BEFORE" == "active" ]]; then
+          sudo systemctl start pulseaudio.service >/dev/null 2>&1 || true
+        elif [[ "$PA_ACTIVE_BEFORE" == "inactive" || "$PA_ACTIVE_BEFORE" == "failed" ]]; then
+          sudo systemctl stop pulseaudio.service >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
+  else
+    log "[root-unlock-restore] systemctl not found; skipping pulseaudio.service restore."
+  fi
+
+  # 4) Remove any XDG_RUNTIME_DIR export block that we previously appended to
+  # /root/.bashrc.
+  local root_bashrc="/root/.bashrc"
+  if sudo test -f "$root_bashrc"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would remove XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS exports added by $SCRIPT_NAME from $root_bashrc (if present)."
+    else
+      sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_bashrc" 2>/dev/null || true
+      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_bashrc" 2>/dev/null || true
+      sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_bashrc" 2>/dev/null || true
+    fi
+  fi
+
+  # 5) If we know which groups we added for root, remove them to return to the
+  # previous membership set. If we do not know, fall back to logging only.
+  if [[ -n "${ADDED_GROUPS:-}" ]]; then
+    local grp
+    for grp in $ADDED_GROUPS; do
+      if getent group "$grp" >/dev/null 2>&1 && id -nG root | grep -qw "$grp"; then
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would remove root from group '$grp' via: sudo gpasswd -d root $grp"
+        else
+          sudo gpasswd -d root "$grp" >/dev/null 2>&1 || true
+          log "[root-unlock-restore] Removed root from group '$grp' (added by --root-unlock)."
+        fi
+      fi
+    done
+  else
+    log "[root-unlock-restore] No ADDED_GROUPS recorded in state; not changing group membership."
+  fi
+
+  log "[root-unlock-restore] Done. Sudoers/polkit/PAM were never changed by --root-unlock, so there is nothing else to restore."
 }
 
 # --- Sanity checks ---
@@ -1496,6 +1813,13 @@ fi
 # Default target user is the current invoking user.
 if [[ -z "$TARGET_USER" ]]; then
   TARGET_USER="$(id -un)"
+fi
+
+# If we're asked to run only the root-unlock restore helper, do that and exit
+# before any of the normal passwordless logic runs.
+if [[ "$root_unlock_restore" -eq 1 ]]; then
+  root_unlock_restore_mode
+  exit 0
 fi
 
 # Standalone root-unlock mode: only tweak root's group memberships so a root
@@ -1537,6 +1861,7 @@ if [[ "$reset_fullacl_env_to_default" -eq 1 && \
   log "Done."
   exit 0
 fi
+
 
 # If we're only asked to install the periodic full-file-permissions
 # systemd service/timer (and not to run the rest of the setup), handle
