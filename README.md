@@ -193,7 +193,7 @@ Basic usage:
   In `--verify` mode, `--relax-mac` does **not** relax anything, but the script will always print a **detailed MAC status report** (AppArmor present/active, SELinux mode).
 
 - `--full-file-permissions`  
-  **Nuclear option** and **ACL-only mode**: when you invoke the script with this flag (and not in `--restore`/`--verify`/`--install-...`/`--uninstall-...` modes), it skips the normal passwordless sudo/polkit/group/PAM configuration and runs **only** a recursive ACL grant equivalent to:
+  **Nuclear option, experimental, NOT READY FOR NORMAL USE** and **ACL-only mode**: when you invoke the script with this flag (and not in `--restore`/`--verify`/`--install-...`/`--uninstall-...` modes), it skips the normal passwordless sudo/polkit/group/PAM configuration and runs **only** a recursive ACL grant equivalent to:
 
   ```bash
   setfacl -R -m u:<TARGET_USER>:rwx /
@@ -208,9 +208,10 @@ Basic usage:
     - wpa_supplicant: `/etc/wpa_supplicant`, `/var/lib/wpa_supplicant`  
     - wicked (SUSE): `/etc/wicked`, `/var/lib/wicked`
 
-  The script wraps this in **extra confirmations**, logs detailed progress using `pv` (including an item count and approximate items/sec), and prints a concise summary at the end.  
-  A small sample of distinct `setfacl` errors (e.g. read-only filesystems, unsupported ACLs) is shown at the end so you can see what failed **without** being flooded by thousands of lines.  
-  See the dedicated section [WARNING: Extremely dangerous `--full-file-permissions` option](#warning-extremely-dangerous--full-file-permissions-option) for a deep dive.
+  Even with these exclusions, this feature is **experimental** and very likely to **permanently break** parts of your system (for example: networking, display manager, container runtimes, or system services whose permissions assumptions are violated by the ACLs). You should expect to need a **full reinstall or offline repair** after serious experimentation with this flag.
+
+  The current implementation wraps the ACL pass in **extra confirmations**, logs detailed progress using `pv` (including an item count and approximate items/sec), and prints a concise summary at the end. A small sample of distinct `setfacl` errors (e.g. read-only filesystems, unsupported ACLs) is shown at the end so you can see what failed **without** being flooded by thousands of lines.  
+  This mode is still **work in progress** and exists primarily for my own experimentation; treat it as an opt-in "I am trying to break my system on purpose" tool, not a supported configuration step.
 
 - `--install-full-file-permissions-service`  
   Install a **systemd service + timer** (`passwordless-fb-fullacl.service` / `passwordless-fb-fullacl.timer`) that periodically re-applies `--full-file-permissions` in the background.  
@@ -251,6 +252,26 @@ Basic usage:
   ```
   
   This can help keep desktop/GUI auth flows effectively passwordless even when polkit JS rules are disabled, but it also removes the traditional Unix password from that account. The script will still ask for explicit confirmation before running `passwd -d`, and respects `--dry-run`.
+
+- `--root-unlock`  
+  **Extremely dangerous, KDE-focused, experimental**: run the script in a **standalone** "root desktop unlock" mode that tweaks only the **root** account, and then exits without touching normal passwordless sudo / polkit for other users. In this mode the script will:
+  - Ensure the `root` account is a member of several desktop / device groups (`audio`, `video`, `input`, `render`, `tty`, etc.) so a root GUI session can see ALSA / PipeWire devices.  
+  - Adjust `/etc/pulse/client.conf` so `autospawn = yes` and `allow-autospawn-for-root = yes`, and optionally unmute ALSA mixer channels using `amixer`, then persist ALSA volume with `alsactl store`.  
+  - Bridge **root audio** to your regular desktop user’s PipeWire / PulseAudio server by exporting `PULSE_SERVER=unix:/run/user/<UID>/pulse/native` (and matching `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS`) into `/root/.bashrc` and `/root/.profile` (and `/root/.zshrc` if it exists). In practice, this makes apps started as root talk to the *non-root* user’s sound server.  
+  - Optionally detect if the **root account itself is locked** in `/etc/shadow` (password field begins with `!` or `*`) and, **only if you explicitly confirm**, run `passwd -u root` to unlock it so GUI/TTY root logins are possible. This is never done silently and is skipped entirely in `--dry-run` mode.  
+  - Write a small state file at `/etc/passwordless-fb-root-unlock.state` so the changes can later be reverted with `--root-unlock-restore`.
+  
+  This mode is primarily designed and tested for **KDE Plasma + PipeWire** on single-user desktops. GNOME, XFCE, Hyprland, and other environments are **not tested** and may behave differently or break. Using `--root-unlock` implies you are comfortable running a full **root GUI session**, with all the risk that entails.
+
+- `--root-unlock-restore`  
+  Companion to `--root-unlock`: attempts to **undo** as many of the root desktop tweaks as possible using the state file and timestamped backups created by the unlock run. In particular it will:
+  - Restore `/etc/pulse/client.conf` from the most recent `.bak.<timestamp>` backup (if present).  
+  - Attempt to restore `/root/.config/pulse`, `/root/.config/pipewire`, and `/root/.local/state/wireplumber` from the latest `*.bak.<timestamp>` directories that `--root-unlock` moved aside.  
+  - Restore the previous `linger` state for root (enable/disable), and the previous `systemctl` enable/active state for `pulseaudio.service`, *if* they were successfully recorded in the state file.  
+  - Remove the `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, and `PULSE_SERVER` exports (and their comments) from `/root/.bashrc`, `/root/.profile`, and `/root/.zshrc` if they were added by `--root-unlock`.  
+  - Optionally remove root from any groups that `--root-unlock` recorded as newly added, returning root’s group membership as closely as possible to its prior state.
+  
+  Because this restore flow depends on the presence and correctness of `/etc/passwordless-fb-root-unlock.state` and backups from the unlock run, it is a **best-effort undo**, not a guarantee. You should still treat `--root-unlock` as a high-risk, hard-to-fully-revert operation.
 
 #### Why `--all-groups` is especially dangerous
 

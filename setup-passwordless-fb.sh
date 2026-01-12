@@ -2005,14 +2005,19 @@ root_unlock_restore_mode() {
 }
 
 # --- Sanity checks ---
-# For the extremely dangerous --full-file-permissions mode, we require the
-# script itself to be run as root so we do not need to invoke sudo thousands of
-# times inside the ACL loop (which can spam sudo.conf warnings).
+# For the extremely dangerous, **experimental** --full-file-permissions mode,
+# we require the script itself to be run as root so we do not need to invoke
+# sudo thousands of times inside the ACL loop (which can spam sudo.conf
+# warnings).
 if [[ "$full_file_permissions" -eq 1 ]]; then
+  warn "[full-file-permissions] EXPERIMENTAL FEATURE - WORK IN PROGRESS."
+  warn "[full-file-permissions] This mode will attempt to grant $TARGET_USER rwx ACLs on most of /." 
+  warn "[full-file-permissions] It is very likely to BREAK your system permanently (networking, display, services)."
+  warn "[full-file-permissions] Only continue if you are experimenting on a throwaway install and have offline backups."
   if [[ "$(id -u)" -ne 0 ]]; then
     die "--full-file-permissions must be run as root. Re-run via: sudo bash $SCRIPT_NAME --user $TARGET_USER --full-file-permissions"
   else
-    warn "Running as root with --full-file-permissions; proceeding with extreme caution."
+    warn "Running as root with --full-file-permissions; proceeding with extreme caution." 
   fi
 else
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -2128,7 +2133,8 @@ if [[ "$full_file_permissions" -eq 1 && \
       "$uninstall_full_file_permissions_service" -eq 0 && \
       "$restore_mode" -eq 0 && \
       "$verify_only" -eq 0 ]]; then
-  warn "[full-file-permissions] Running in ACL-only mode: will apply recursive ACLs for $TARGET_USER and then exit (no sudoers/polkit/group/PAM changes)."
+  warn "[full-file-permissions] Running in ACL-only mode (EXPERIMENTAL, NOT READY FOR NORMAL USE)."
+  warn "[full-file-permissions] This may irreversibly change permissions and ACLs across your system and is expected to break things."
   configure_full_file_permissions
   log "Done."
   exit 0
