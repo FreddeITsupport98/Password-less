@@ -1488,6 +1488,7 @@ root_unlock_standalone_for_root() {
   local configs_moved=0
   local added_groups=()
   local audio_stack
+  local enable_group_tweaks=1
   local linger_before="unknown"
   local pa_enabled_before="unknown"
   local pa_active_before="unknown"
@@ -1558,27 +1559,40 @@ root_unlock_standalone_for_root() {
   getent passwd "$root_user" >/dev/null 2>&1 || die "User 'root' does not exist (unexpected)."
 
   # 1) Desktop/device-related groups: sound, graphics, input, etc.
-  local grp
-  for grp in root disk wheel systemd-journal network video audio pulse-access input render kvm tty tape shadow kmem; do
-    # Skip groups that do not exist on this system.
-    if ! getent group "$grp" >/dev/null 2>&1; then
-      log "[root-unlock] Group $grp does not exist on this system; skipping."
-      continue
+  # Historically this script added root to a very broad set of groups
+  # (disk, wheel, shadow, etc.). That can be surprising and is rarely
+  # required for GUI/audio. We now limit this to a smaller set of
+  # desktop/device groups and make it optional.
+  if [[ "$dry_run" -eq 0 && "$assume_yes" -eq 0 ]]; then
+    if ! confirm "[root-unlock] Add root to extra desktop/audio device groups (video, audio, pulse-access, input, render, kvm)?"; then
+      enable_group_tweaks=0
+      log "[root-unlock] Skipping additional group memberships for root (per your choice)."
     fi
+  fi
 
-    log "[root-unlock] Ensuring $root_user is in $grp group..."
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would run: sudo usermod -aG $grp $root_user"
-    else
-      if id -nG "$root_user" | grep -qw "$grp"; then
-        log "[root-unlock] $root_user is already in $grp group; skipping."
-      else
-        sudo usermod -aG "$grp" "$root_user"
-        added_groups+=("$grp")
-        log "[root-unlock] Added $root_user to $grp group. You may need to log out and back in to the root session for this to take effect."
+  if [[ "$enable_group_tweaks" -eq 1 ]]; then
+    local grp
+    for grp in video audio pulse-access input render kvm; do
+      # Skip groups that do not exist on this system.
+      if ! getent group "$grp" >/dev/null 2>&1; then
+        log "[root-unlock] Group $grp does not exist on this system; skipping."
+        continue
       fi
-    fi
-  done
+
+      log "[root-unlock] Ensuring $root_user is in $grp group..."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would run: sudo usermod -aG $grp $root_user"
+      else
+        if id -nG "$root_user" | grep -qw "$grp"; then
+          log "[root-unlock] $root_user is already in $grp group; skipping."
+        else
+          sudo usermod -aG "$grp" "$root_user"
+          added_groups+=("$grp")
+          log "[root-unlock] Added $root_user to $grp group. You may need to log out and back in to the root session for this to take effect."
+        fi
+      fi
+    done
+  fi
 
   # 2) PulseAudio: allow root to autospawn its own server. Only do this when
   # the audio stack appears to be PulseAudio-compatible.
