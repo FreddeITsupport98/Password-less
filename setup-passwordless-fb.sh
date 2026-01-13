@@ -64,6 +64,7 @@ polkit_js_maybe_unsupported=0
 reset_fullacl_env_to_default=0
 allow_root_target=0  # When set via --root-unlock, run a standalone "root desktop unlock" mode.
 root_unlock_restore=0
+ROOT_LOCK_STATE_BEFORE=""
 TARGET_USER=""
 POLKIT_TMP=""
 POLKIT_RULE_PATH=""
@@ -1301,6 +1302,7 @@ maybe_unlock_root_account_for_gui() {
   pw_field="$(sudo awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null || echo "")"
   if [[ -z "$pw_field" ]]; then
     log "[root-unlock] Could not read root's password field from /etc/shadow; skipping lock check."
+    ROOT_LOCK_STATE_BEFORE="unknown"
     return 0
   fi
 
@@ -1308,8 +1310,11 @@ maybe_unlock_root_account_for_gui() {
   # conventions across PAM implementations).
   if [[ "$pw_field" != "!"* && "$pw_field" != "*"* ]]; then
     log "[root-unlock] Root account does not appear locked in /etc/shadow; leaving as-is."
+    ROOT_LOCK_STATE_BEFORE="unlocked"
     return 0
   fi
+
+  ROOT_LOCK_STATE_BEFORE="locked"
 
   warn "[root-unlock] Root account appears to be LOCKED in /etc/shadow (password field begins with '!' or '*')."
   warn "[root-unlock] If you want to allow direct root logins (TTY/GUI), you can unlock the account, but this is dangerous."
@@ -1732,6 +1737,7 @@ EOF
     printf 'LINGER_BEFORE=%s\n' "${linger_before:-unknown}"
     printf 'PA_ENABLED_BEFORE=%s\n' "${pa_enabled_before:-unknown}"
     printf 'PA_ACTIVE_BEFORE=%s\n' "${pa_active_before:-unknown}"
+    printf 'ROOT_LOCK_STATE_BEFORE=%s\n' "${ROOT_LOCK_STATE_BEFORE:-unknown}"
     printf 'ADDED_GROUPS="%s"\n' "${added_groups[*]}"
   } >"$tmp_state"
   write_root_file "$tmp_state" "$state_path" 0644
@@ -1848,6 +1854,7 @@ root_unlock_restore_mode() {
   local LINGER_BEFORE=""
   local PA_ENABLED_BEFORE=""
   local PA_ACTIVE_BEFORE=""
+  local ROOT_LOCK_STATE_BEFORE=""
   local ADDED_GROUPS=""
 
   if [[ -r "$state_path" ]]; then
@@ -2014,6 +2021,50 @@ root_unlock_restore_mode() {
     done
   else
     log "[root-unlock-restore] No ADDED_GROUPS recorded in state; not changing group membership."
+  fi
+
+  # 6) Optionally restore the root account lock state to what it was before
+  # --root-unlock ran, if we have a recorded value and can determine the
+  # current state.
+  if sudo test -f /etc/shadow; then
+    local cur_pw_field cur_lock_state
+    cur_pw_field="$(sudo awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null || echo "")"
+    if [[ -z "$cur_pw_field" ]]; then
+      cur_lock_state="unknown"
+    elif [[ "$cur_pw_field" == "!"* || "$cur_pw_field" == "*"* ]]; then
+      cur_lock_state="locked"
+    else
+      cur_lock_state="unlocked"
+    fi
+
+    if [[ -n "${ROOT_LOCK_STATE_BEFORE:-}" && "${ROOT_LOCK_STATE_BEFORE}" != "unknown" && "$cur_lock_state" != "unknown" ]]; then
+      if [[ "$ROOT_LOCK_STATE_BEFORE" == "$cur_lock_state" ]]; then
+        log "[root-unlock-restore] Root account lock state already matches recorded pre-root-unlock state ($cur_lock_state); leaving as-is."
+      else
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would change root lock state from '$cur_lock_state' back to '${ROOT_LOCK_STATE_BEFORE}'."
+        else
+          case "$ROOT_LOCK_STATE_BEFORE" in
+            locked)
+              if confirm "Root was locked before --root-unlock and is now unlocked. Lock root again to restore original behavior (disable direct root logins)?"; then
+                sudo passwd -l root >/dev/null 2>&1 || warn "[root-unlock-restore] Failed to lock root account via passwd -l."
+              else
+                log "[root-unlock-restore] Leaving root account unlocked at your request."
+              fi
+              ;;
+            unlocked)
+              if confirm "Root was unlocked before --root-unlock and is now locked. Unlock root again to restore original behavior (allow direct root logins)?"; then
+                sudo passwd -u root >/dev/null 2>&1 || warn "[root-unlock-restore] Failed to unlock root account via passwd -u."
+              else
+                log "[root-unlock-restore] Leaving root account locked at your request."
+              fi
+              ;;
+          esac
+        fi
+      fi
+    fi
+  else
+    log "[root-unlock-restore] /etc/shadow not found; cannot adjust root lock state."
   fi
 
   log "[root-unlock-restore] Done. Sudoers/polkit/PAM were never changed by --root-unlock, so there is nothing else to restore."
