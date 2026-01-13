@@ -677,47 +677,81 @@ have_polkit_pkla_dirs() {
 
 can_system_accept_empty_passwords() {
   # Heuristic check whether the PAM stack appears to allow empty passwords
-  # via pam_unix.so with the "nullok" option.
+  # via pam_unix(.so) with the "nullok" option.
   #
   # This does *not* guarantee a specific login path will accept an empty
   # password, but if we see no evidence of nullok at all, then running
   # "passwd -d" is much more likely to result in a locked / unusable
   # account instead of a truly passwordless one.
+  local pam_dir="/etc/pam.d"
+  local found_nullok=0
 
-  # If pam_unix.so is only configured with nullok_secure, treat that as
-  # effectively "no" for our purposes (it's typically limited to very
-  # restricted TTYs).
-  if grep -rEq '^[[:space:]]*auth.*pam_unix\.so.*nullok_secure' /etc/pam.d 2>/dev/null; then
-    warn "[pam-nullok] Found pam_unix.so with nullok_secure in /etc/pam.d; treating system as NOT safe for empty passwords."
-    return 1
-  fi
+  # Scan all pam_unix auth lines once, then classify each line.
+  #
+  # IMPORTANT: We deliberately do *not* treat the mere presence of
+  # nullok_secure in any file as a global failure. It is common and
+  # reasonable to use nullok_secure for TTY logins while using bare
+  # nullok for other stacks (e.g. sshd, su). Here we only consider the
+  # system "accepting empty passwords" if we see at least one auth line
+  # that contains nullok *without* nullok_secure on the same line.
+  while IFS=: read -r file line; do
+    [[ -z "$line" ]] && continue
 
-  # Look for a pam_unix.so auth line with "nullok" (but not nullok_secure).
-  # For easier debugging, log the first matching location when we find one.
-  local first_match
-  first_match=$(grep -rEn '^[[:space:]]*auth.*pam_unix\\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null | head -n1 || true)
-  if [[ -n "$first_match" ]]; then
-    log "[pam-nullok] Detected pam_unix.so with nullok on auth line: $first_match"
+    # Ignore commented lines defensively (grep pattern already avoids
+    # most of these, but this is cheap and robust).
+    if [[ "$line" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    # Detect bare nullok (our desired permissive setting). We require a
+    # non-identifier boundary after nullok so that options like
+    # nullok_secure or nullok_always do not count. Additionally, we
+    # require that nullok_secure is *not* present on the same line; a
+    # TTY-only nullok_secure line does not mean the whole stack accepts
+    # empty passwords.
+    if [[ "$line" =~ [[:space:]]nullok([^[:alnum:]_]|$) ]] && \
+       [[ ! "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
+      log "[pam-nullok] Found pam_unix nullok (without nullok_secure) in $file: $line"
+      found_nullok=1
+    fi
+  done < <(grep -rE '^[[:space:]]*auth.*pam_unix(\.so)?' "$pam_dir" 2>/dev/null || true)
+
+  if [[ "$found_nullok" -eq 1 ]]; then
     return 0
   fi
 
-  log "[pam-nullok] No pam_unix.so auth line with nullok found under /etc/pam.d; treating system as NOT safe for empty passwords."
+  # Default: no bare nullok directive found at all.
   return 1
 }
 
 verify_pam_nullok_status() {
-  log "[pam-nullok] Inspecting /etc/pam.d for pam_unix.so nullok / nullok_secure..."
+  local pam_dir="/etc/pam.d"
+  local had_output=0
 
-  if grep -rEn '^[[:space:]]*auth.*pam_unix\.so.*nullok_secure' /etc/pam.d 2>/dev/null; then
-    warn "[pam-nullok] Above lines show pam_unix.so with nullok_secure (treated as NOT safe for empty passwords)."
-  else
-    log "[pam-nullok] No pam_unix.so auth line with nullok_secure found."
-  fi
+  log "[pam-nullok] Inspecting $pam_dir for pam_unix(.so) nullok / nullok_secure..."
 
-  if grep -rEn '^[[:space:]]*auth.*pam_unix\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null; then
-    log "[pam-nullok] Above lines show pam_unix.so auth entries with nullok (without nullok_secure)."
-  else
-    log "[pam-nullok] No pam_unix.so auth line with bare nullok found."
+  # Print all relevant lines, distinguishing between nullok and
+  # nullok_secure on a per-line basis.
+  while IFS=: read -r file line; do
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    if [[ "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
+      warn "[pam-nullok] nullok_secure: $file: $line"
+      had_output=1
+    fi
+    if [[ "$line" =~ [[:space:]]nullok([^[:alnum:]_]|$) ]] && \
+       [[ ! "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
+      log "[pam-nullok] nullok:        $file: $line"
+      had_output=1
+    fi
+  done < <(grep -rE '^[[:space:]]*auth.*pam_unix(\.so)?' "$pam_dir" 2>/dev/null || true)
+
+  if [[ "$had_output" -eq 0 ]]; then
+    log "[pam-nullok] No pam_unix(.so) auth lines found under $pam_dir."
   fi
 
   if can_system_accept_empty_passwords; then

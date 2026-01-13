@@ -26,7 +26,7 @@ can_system_accept_empty_passwords() {
 
   # Look for a pam_unix.so auth line with "nullok" (but not nullok_secure).
   local first_match
-  first_match=$(grep -rEn '^[[:space:]]*auth.*pam_unix\\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null | head -n1 || true)
+  first_match=$(grep -rEn '^[[:space:]]*auth.*pam_unix\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null | head -n1 || true)
   if [[ -n "$first_match" ]]; then
     log "[pam-nullok] Detected pam_unix.so with nullok on auth line: $first_match"
     return 0
@@ -48,7 +48,7 @@ verify_pam_nullok_status() {
   if grep -rEn '^[[:space:]]*auth.*pam_unix\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null; then
     log "[pam-nullok] Above lines show pam_unix.so auth entries with nullok (without nullok_secure)."
   else
-    log "[pam-nullok] No pam_unix.so auth line with bare nullok found."
+    log "[pam-nullok] No pam-unix.so auth line with bare nullok found."
   fi
 
   if can_system_accept_empty_passwords; then
