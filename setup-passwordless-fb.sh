@@ -1514,9 +1514,20 @@ root_unlock_standalone_for_root() {
   fi
   if have_cmd systemctl; then
     # systemctl can sometimes print multi-line diagnostics; capture only the
-    # first non-empty token so the state file remains shell-safe.
-    pa_enabled_before="$(systemctl is-enabled pulseaudio.service 2>/dev/null | awk 'NF{print $1; exit}' || echo "unknown")"
-    pa_active_before="$(systemctl is-active pulseaudio.service 2>/dev/null | awk 'NF{print $1; exit}' || echo "unknown")"
+    # first non-empty token so the state file remains shell-safe. We avoid
+    # mixing multi-line diagnostics with our value by explicitly normalizing
+    # to a single word and falling back to "unknown" when empty.
+    local pa_enabled_raw pa_active_raw
+    pa_enabled_raw="$(systemctl is-enabled pulseaudio.service 2>/dev/null || true)"
+    pa_active_raw="$(systemctl is-active pulseaudio.service 2>/dev/null || true)"
+    pa_enabled_before="$(printf '%s\n' "$pa_enabled_raw" | awk 'NF{print $1; exit}')"
+    pa_active_before="$(printf '%s\n' "$pa_active_raw" | awk 'NF{print $1; exit}')"
+    if [[ -z "$pa_enabled_before" ]]; then
+      pa_enabled_before="unknown"
+    fi
+    if [[ -z "$pa_active_before" ]]; then
+      pa_active_before="unknown"
+    fi
   fi
 
   log "[root-unlock] Running standalone root desktop unlock mode (groups + audio config; no sudoers/polkit/PAM changes)."
@@ -1579,6 +1590,9 @@ root_unlock_standalone_for_root() {
     if [[ "$dry_run" -eq 1 ]]; then
       : # already logged above
     else
+      # Make a timestamped backup of the existing client.conf so
+      # --root-unlock-restore can put it back later.
+      backup_if_exists "$pulse_client"
       # If the key exists (commented or not), normalize it; otherwise append.
       if sudo grep -Eq '^[[:space:]]*allow-autospawn-for-root' "$pulse_client"; then
         sudo sed -i 's/^[[:space:]]*allow-autospawn-for-root.*/allow-autospawn-for-root = yes/' "$pulse_client" || \
