@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Force a stable C/POSIX locale so that command output parsing (pactl, systemctl,
+# etc.) is not affected by system localization.
+export LC_ALL=C
+export LANG=C
+
 # Passwordless sudo + polkit approval for a single user.
 # WARNING: This grants root-equivalent power without authentication.
 #
@@ -68,6 +73,14 @@ ROOT_LOCK_STATE_BEFORE=""
 TARGET_USER=""
 POLKIT_TMP=""
 POLKIT_RULE_PATH=""
+
+# Shell configuration files for the root user that we may inject environment
+# overrides into (and later clean up from) during --root-unlock flows.
+ROOT_SHELL_RC_FILES=(
+  "/root/.bashrc"
+  "/root/.profile"
+  "/root/.zshrc"
+)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -289,30 +302,75 @@ install_deps_if_missing() {
   esac
 }
 
+MANIFEST_FILE="/etc/passwordless-fb-installed.manifest"
+
+register_file_change() {
+  local file="$1"
+  local backup="$2"
+
+  # Only append if not already recorded for this file.
+  if sudo test -f "$MANIFEST_FILE"; then
+    if sudo grep -q "^FILE:$file:" "$MANIFEST_FILE" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would register FILE:$file:$backup in $MANIFEST_FILE"
+  else
+    sudo sh -c "echo 'FILE:$file:$backup' >> '$MANIFEST_FILE'"
+  fi
+}
+
 backup_if_exists() {
   local path="$1"
+  local orig="${path}.orig"
+
   if sudo test -e "$path"; then
     if [[ "$force" -ne 1 ]]; then
-      die "Refusing to overwrite existing $path. Re-run with --force to overwrite (a backup will be created)."
+      die "Refusing to overwrite existing $path. Re-run with --force to overwrite (a backup of the original will be created)."
     fi
-    local ts
-    ts="$(date +%Y%m%d-%H%M%S)"
-    local bak="${path}.bak.${ts}"
-    warn "Backing up existing $path -> $bak"
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would backup $path to $bak"
+
+    # Preserve the original state exactly once using a stable .orig name so
+    # subsequent runs cannot clobber the first clean backup.
+    if ! sudo test -e "$orig"; then
+      warn "Backing up original $path -> $orig"
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would backup $path to $orig"
+      else
+        sudo cp -a "$path" "$orig"
+        register_file_change "$path" "$orig"
+      fi
     else
-      sudo cp -a "$path" "$bak"
+      log "[info] Original backup $orig already exists; not overwriting."
     fi
+  else
+    # Track that we are about to create a new file so uninstall/restore logic
+    # can know this file did not exist before the script ran.
+    register_file_change "$path" "CREATED"
   fi
 }
 
 restore_latest_backup_for() {
-  # Restore the most recent .bak.* for the given path, if any.
+  # Restore a backup for the given path, preferring a stable .orig backup when
+  # present and otherwise falling back to the most recent timestamped .bak.*
+  # created by older versions of this script.
   local path="$1"
-  local pattern="${path}.bak.*"
+  local orig="${path}.orig"
+  local pattern
   local latest
 
+  if sudo test -e "$orig"; then
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would restore $path from original backup $orig"
+      return 0
+    fi
+    warn "Restoring $path from original backup $orig"
+    sudo install -o root -g root -m "$(stat -c '%a' "$orig" 2>/dev/null || echo 440)" "$orig" "$path"
+    return 0
+  fi
+
+  pattern="${path}.bak.*"
   latest="$(ls -1t $pattern 2>/dev/null | head -n1 || true)"
   if [[ -z "$latest" ]]; then
     log "[restore] No backups found for $path (pattern: $pattern); skipping."
@@ -326,6 +384,47 @@ restore_latest_backup_for() {
 
   warn "Restoring $path from backup $latest"
   sudo install -o root -g root -m "$(stat -c '%a' "$latest" 2>/dev/null || echo 440)" "$latest" "$path"
+}
+
+restore_from_manifest() {
+  # Restore files based on the manifest created by register_file_change.
+  # This allows deterministic uninstall of everything the script touched,
+  # including files that did not previously exist.
+  if ! sudo test -f "$MANIFEST_FILE"; then
+    return 1
+  fi
+
+  log "[restore] Reading manifest: $MANIFEST_FILE"
+
+  while IFS=':' read -r type file backup_or_state; do
+    [[ "$type" != "FILE" ]] && continue
+
+    if [[ "$backup_or_state" == "CREATED" ]]; then
+      if sudo test -e "$file"; then
+        log "[restore] Deleting file created by script: $file"
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would delete $file"
+        else
+          sudo rm -f "$file" 2>/dev/null || true
+        fi
+      fi
+    elif sudo test -f "$backup_or_state"; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would restore $file from $backup_or_state"
+      else
+        log "[restore] Restoring $file from $backup_or_state"
+        sudo cp -a "$backup_or_state" "$file"
+      fi
+    fi
+  done < <(sudo cat "$MANIFEST_FILE" 2>/dev/null || true)
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would remove manifest file $MANIFEST_FILE"
+  else
+    sudo rm -f "$MANIFEST_FILE" 2>/dev/null || true
+  fi
+
+  return 0
 }
 
 write_root_file() {
@@ -381,6 +480,15 @@ ensure_main_sudoers_has_user_nopasswd() {
   # If /etc/sudoers is missing, do nothing (that would be a badly broken system).
   if ! sudo test -e "$main"; then
     warn "Main sudoers file $main not found; skipping direct edit."
+    return 0
+  fi
+
+  # If the main sudoers already includes /etc/sudoers.d via #includedir, rely
+  # exclusively on the drop-in we manage in $SUDOERS_DEST and avoid touching
+  # the primary file. This reduces the risk of breaking sudo during OS updates
+  # or diverging from the distro's packaged sudoers.
+  if sudo grep -Eq '^[[:space:]]*#includedir[[:space:]]+/etc/sudoers\.d' "$main"; then
+    log "[info] $main already includes /etc/sudoers.d; relying on $SUDOERS_DEST drop-in only and skipping direct edit of $main."
     return 0
   fi
 
@@ -536,6 +644,19 @@ have_suse_polkit_defaults() {
   return 1
 }
 
+have_polkit_pkla_dirs() {
+  # Detect legacy polkit .pkla configuration directories used by older
+  # enterprise-style distros (e.g. RHEL/CentOS 7-era) where JavaScript
+  # rules are not the primary mechanism.
+  local d
+  for d in /etc/polkit-1/localauthority /var/lib/polkit-1/localauthority; do
+    if [[ -d "$d" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 configure_polkit_for_user_suse() {
   # Best-effort integration with SUSE's polkit-default-privs mechanism.
   # We avoid editing JS rules directly when a distro-specific mechanism
@@ -575,6 +696,58 @@ configure_polkit_for_user_suse() {
     fi
   else
     warn "[polkit-suse] set_polkit_default_privs not found; you may need to apply polkit-default-privs manually."
+  fi
+
+  return 0
+}
+
+configure_polkit_for_user_pkla() {
+  # Configure polkit using the legacy .pkla mechanism under
+  # /etc/polkit-1/localauthority or /var/lib/polkit-1/localauthority, which is
+  # still common on older enterprise distributions.
+  local base_dir=""
+  local local_dir
+  local pkla_path
+  local tmp
+
+  if [[ -d /etc/polkit-1/localauthority ]]; then
+    base_dir="/etc/polkit-1/localauthority"
+  elif [[ -d /var/lib/polkit-1/localauthority ]]; then
+    base_dir="/var/lib/polkit-1/localauthority"
+  else
+    return 1
+  fi
+
+  local_dir="${base_dir}/50-local.d"
+  pkla_path="${local_dir}/10-allow-${TARGET_USER}-everything.pkla"
+  POLKIT_RULE_PATH="$pkla_path"
+
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+# Generated by $SCRIPT_NAME
+# WARNING: This approves all polkit actions for $TARGET_USER.
+[Allow $TARGET_USER all]
+Identity=unix-user:$TARGET_USER
+Action=*
+ResultActive=yes
+ResultAny=yes
+ResultInactive=yes
+EOF
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would ensure directory exists: $local_dir"
+    log "[dry-run] Would install pkla file at $pkla_path"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  sudo mkdir -p "$local_dir"
+  write_root_file "$tmp" "$pkla_path" 0644
+  rm -f "$tmp"
+
+  log "[info] Restarting polkit (best-effort) after installing pkla rule..."
+  if ! restart_polkit_best_effort; then
+    warn "Could not restart polkit automatically after pkla install. You may need to reboot or restart polkit manually."
   fi
 
   return 0
@@ -841,8 +1014,33 @@ send_fullacl_notification() {
 detect_audio_stack_for_current_user() {
   local stack="unknown"
 
-  # Prefer systemd user units when available; they tend to be the most
-  # reliable cross-distro signal.
+  # Prefer pactl info as the source of truth when available, since it reflects
+  # the actual server we're talking to (PulseAudio, PipeWire, or
+  # PulseAudio-on-PipeWire) regardless of how it is started.
+  if have_cmd pactl; then
+    local info server_string server_name combined
+    if info="$(pactl info 2>/dev/null)"; then
+      server_string="$(printf '%s\n' "$info" | awk -F': ' '/^Server String:/ {print $2}' | head -n1)"
+      server_name="$(printf '%s\n' "$info" | awk -F': ' '/^Server Name:/ {print $2}' | head -n1)"
+      combined="${server_string} ${server_name}"
+
+      if printf '%s\n' "$combined" | grep -qi 'PulseAudio (on PipeWire)'; then
+        stack="pipewire-pulse"
+      elif printf '%s\n' "$combined" | grep -qi 'PipeWire'; then
+        stack="pipewire"
+      elif printf '%s\n' "$combined" | grep -qi 'PulseAudio'; then
+        stack="pulseaudio"
+      fi
+
+      if [[ "$stack" != "unknown" ]]; then
+        printf '%s\n' "$stack"
+        return 0
+      fi
+    fi
+  fi
+
+  # Fallback: use systemd user units when available; they tend to be a
+  # reasonably reliable cross-distro signal.
   if have_cmd systemctl; then
     if systemctl --user is-active pipewire-pulse.service >/dev/null 2>&1; then
       stack="pipewire-pulse"
@@ -853,19 +1051,12 @@ detect_audio_stack_for_current_user() {
     fi
   fi
 
-  # Fallbacks when systemd user units are inactive or missing.
-  if [[ "$stack" == "unknown" ]]; then
-    if have_cmd pactl && pactl info >/dev/null 2>&1; then
-      # If pactl is talking to a PipeWire-backed Pulse server, the server
-      # string will usually mention PipeWire; we don't rely on that detail
-      # though and just treat it generically as "pulseaudio".
+  # Last-resort heuristic: look for processes owned by the current user.
+  if [[ "$stack" == "unknown" ]] && have_cmd pgrep; then
+    if pgrep -u "$(id -u)" pipewire >/dev/null 2>&1; then
+      stack="pipewire"
+    elif pgrep -u "$(id -u)" pulseaudio >/dev/null 2>&1; then
       stack="pulseaudio"
-    elif have_cmd pgrep; then
-      if pgrep -u "$(id -u)" pipewire >/dev/null 2>&1; then
-        stack="pipewire"
-      elif pgrep -u "$(id -u)" pulseaudio >/dev/null 2>&1; then
-        stack="pulseaudio"
-      fi
     fi
   fi
 
@@ -909,17 +1100,37 @@ configure_full_file_permissions() {
   # passwordless configuration flow, but we still surface a warning.
   # (acl_had_errors is declared at the top of this function.)
   
-  # Common prune expression used by all find invocations below. We exclude
+  # Common exclusion set used by all find invocations below. We exclude
   # pseudo-filesystems (proc, sys, dev, run, boot/efi, snap) **and** a set of
-  # particularly sensitive network configuration/state trees to reduce the
-  # chance of breaking core connectivity when applying ACLs.
-  #
-  # Currently excluded network trees (best-effort, cross-distro heuristics):
-  #   - NetworkManager: /etc/NetworkManager, /var/lib/NetworkManager, /usr/lib/NetworkManager
-  #   - systemd-networkd: /etc/systemd/network, /var/lib/systemd/network
-  #   - connman: /etc/connman, /var/lib/connman
-  #   - wpa_supplicant: /etc/wpa_supplicant, /var/lib/wpa_supplicant
-  #   - wicked (common on SUSE): /etc/wicked, /var/lib/wicked
+  # particularly sensitive network/container/database configuration trees to
+  # reduce the chance of breaking core connectivity or corrupting container
+  # images when applying ACLs.
+  local EXCLUDE_PATHS=(
+    "/proc" "/sys" "/dev" "/run" "/boot/efi" "/snap"
+    "/etc/NetworkManager" "/var/lib/NetworkManager" "/usr/lib/NetworkManager"
+    "/etc/systemd/network" "/var/lib/systemd/network"
+    "/etc/connman" "/var/lib/connman"
+    "/etc/wpa_supplicant" "/var/lib/wpa_supplicant"
+    "/etc/wicked" "/var/lib/wicked"
+    "/var/lib/docker" "/var/lib/containers" "/var/lib/kubelet" "/var/lib/rancher"
+    "/var/lib/mysql" "/var/lib/postgresql" "/var/lib/pgsql"
+    "/var/lib/flatpak"
+  )
+
+  # Build the find command once so the exclusion logic cannot drift between the
+  # counting, pv, and fallback paths.
+  local FIND_CMD=(find / -xdev "(")
+  local p
+  local first=1
+  for p in "${EXCLUDE_PATHS[@]}"; do
+    if [[ "$first" -eq 0 ]]; then
+      FIND_CMD+=(-o)
+    else
+      first=0
+    fi
+    FIND_CMD+=(-path "$p")
+  done
+  FIND_CMD+=(")" -prune -o -print)
 
   # Check if pv is available for progress display
   if have_cmd pv; then
@@ -928,14 +1139,7 @@ configure_full_file_permissions() {
     local total_files
     # We deliberately ignore failures in this pipeline and validate the result
     # instead of mixing a partial count with a fallback value.
-    total_files=$(find / -xdev \
-      \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \
-         -o -path /etc/NetworkManager -o -path /var/lib/NetworkManager -o -path /usr/lib/NetworkManager \
-         -o -path /etc/systemd/network -o -path /var/lib/systemd/network \
-         -o -path /etc/connman -o -path /var/lib/connman \
-         -o -path /etc/wpa_supplicant -o -path /var/lib/wpa_supplicant \
-         -o -path /etc/wicked -o -path /var/lib/wicked \) -prune -o -print \
-      2>/dev/null | wc -l 2>/dev/null | awk '{print $1}' || true)
+    total_files=$("${FIND_CMD[@]}" 2>/dev/null | wc -l 2>/dev/null | awk '{print $1}' || true)
 
     # Only use a total when it looks like a sane non-zero integer; otherwise
     # fall back to an open-ended progress indicator.
@@ -945,14 +1149,9 @@ configure_full_file_permissions() {
       # paths so that pv's -l counter matches the wc -l total above.
       local start_ts end_ts elapsed rate
       start_ts="$(date +%s)"
-      find / -xdev \
-        \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \
-           -o -path /etc/NetworkManager -o -path /var/lib/NetworkManager -o -path /usr/lib/NetworkManager \
-           -o -path /etc/systemd/network -o -path /var/lib/systemd/network \
-           -o -path /etc/connman -o -path /var/lib/connman \
-           -o -path /etc/wpa_supplicant -o -path /var/lib/wpa_supplicant \
-           -o -path /etc/wicked -o -path /var/lib/wicked \) -prune -o -print \
-        2>/dev/null | pv -l -s "$total_files" -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+      "${FIND_CMD[@]}" 2>/dev/null |
+        pv -l -s "$total_files" -p -e -f -N "Applying ACLs" |
+        xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' | tee -a "$acl_err_log" >&2) || {
         warn "ACL application encountered some errors (often due to read-only filesystems or unsupported ACLs). Some files may not have been processed. See setfacl warnings above if you care about 100% coverage."
         acl_had_errors=1
@@ -974,14 +1173,9 @@ configure_full_file_permissions() {
       log "[info] Could not count files reliably (got: '$total_files'). Using progress indicator without total..."
       local start_ts end_ts elapsed
       start_ts="$(date +%s)"
-      find / -xdev \
-        \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \
-           -o -path /etc/NetworkManager -o -path /var/lib/NetworkManager -o -path /usr/lib/NetworkManager \
-           -o -path /etc/systemd/network -o -path /var/lib/systemd/network \
-           -o -path /etc/connman -o -path /var/lib/connman \
-           -o -path /etc/wpa_supplicant -o -path /var/lib/wpa_supplicant \
-           -o -path /etc/wicked -o -path /var/lib/wicked \) -prune -o -print \
-        2>/dev/null | pv -l -p -e -f -N "Applying ACLs" | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+      "${FIND_CMD[@]}" 2>/dev/null |
+        pv -l -p -e -f -N "Applying ACLs" |
+        xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
         2> >(tee -a "$acl_err_log" >&2 | grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
         warn "ACL application encountered some errors (often due to read-only filesystems or unsupported ACLs). Some files may not have been processed. See setfacl warnings above if you care about 100% coverage."
         acl_had_errors=1
@@ -1000,18 +1194,12 @@ configure_full_file_permissions() {
     fi
   else
     # No pv available, fall back to a simpler find+xargs pipeline (still using
-    # the same prune set) instead of a raw recursive setfacl on /. This keeps
-    # behavior consistent (including NetworkManager-related exclusions) and
-    # avoids hammering pseudo-filesystems.
+    # the same exclusion set) instead of a raw recursive setfacl on /. This keeps
+    # behavior consistent and avoids hammering pseudo-filesystems and
+    # container/overlay backends.
     log "[info] 'pv' not found. Running without progress bar (install 'pv' for progress display)..."
-    find / -xdev \
-      \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /boot/efi -o -path /snap \
-         -o -path /etc/NetworkManager -o -path /var/lib/NetworkManager -o -path /usr/lib/NetworkManager \
-         -o -path /etc/systemd/network -o -path /var/lib/systemd/network \
-         -o -path /etc/connman -o -path /var/lib/connman \
-         -o -path /etc/wpa_supplicant -o -path /var/lib/wpa_supplicant \
-         -o -path /etc/wicked -o -path /var/lib/wicked \) -prune -o -print \
-      2>/dev/null | xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+    "${FIND_CMD[@]}" 2>/dev/null |
+      xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
       2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
       warn "ACL application encountered errors or was interrupted. Some files may not have been processed."
       acl_had_errors=1
@@ -1765,50 +1953,50 @@ EOF
   # [Improvement] Ensure root shells know where the audio server is.
   # Without this, running apps from a terminal (like 'mpv') often fails
   # because XDG_RUNTIME_DIR is unset or points to the wrong place.
-  local root_bashrc="/root/.bashrc"
-  # Create a minimal /root/.bashrc if it does not exist so we have a stable
-  # place to inject environment overrides.
-  if ! sudo test -f "$root_bashrc"; then
-    log "[root-unlock] Creating minimal $root_bashrc for root shell env overrides..."
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would create $root_bashrc with a basic header."
-    else
-      sudo sh -c "printf '# ~/.bashrc (created by %s for audio/GUI tweaks)\n' '$SCRIPT_NAME' > '$root_bashrc'"
-    fi
-  fi
+  #
+  # We treat /root/.bashrc and /root/.profile as files we can auto-create with
+  # a small header if they do not exist yet, but we will only append to
+  # /root/.zshrc when it is already present.
+  local rc base
+  for rc in "${ROOT_SHELL_RC_FILES[@]}"; do
+    base="${rc##*/}"
 
-  if sudo test -f "$root_bashrc"; then
-    if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_bashrc"; then
-      log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc for root shells..."
-      if [[ "$dry_run" -eq 1 ]]; then
-        log "[dry-run] Would append env exports for XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_bashrc."
-      else
-        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$root_bashrc'"
+    if ! sudo test -f "$rc"; then
+      case "$base" in
+        .bashrc)
+          log "[root-unlock] Creating minimal $rc for root shell env overrides..."
+          if [[ "$dry_run" -eq 1 ]]; then
+            log "[dry-run] Would create $rc with a basic header."
+          else
+            sudo sh -c "printf '# ~/.bashrc (created by %s for audio/GUI tweaks)\n' '$SCRIPT_NAME' > '$rc'"
+          fi
+          ;;
+        .profile)
+          log "[root-unlock] Creating minimal $rc for root login-shell env overrides..."
+          if [[ "$dry_run" -eq 1 ]]; then
+            log "[dry-run] Would create $rc with a basic header."
+          else
+            sudo sh -c "printf '# ~/.profile (created by %s for audio/GUI tweaks)\\n' '$SCRIPT_NAME' > '$rc'"
+          fi
+          ;;
+        *)
+          # Do not auto-create other rc files (e.g. .zshrc); only append if
+          # they already exist.
+          ;;
+      esac
+    fi
+
+    if sudo test -f "$rc"; then
+      if ! sudo grep -q "XDG_RUNTIME_DIR" "$rc"; then
+        log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $rc for root shells..."
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would append env exports for XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $rc."
+        else
+          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$rc'"
+        fi
       fi
     fi
-  fi
-
-  # Also patch /root/.profile so login shells (sh, bash, zsh, etc.) inherit
-  # the same environment, not just interactive bash.
-  local root_profile="/root/.profile"
-  if ! sudo test -f "$root_profile"; then
-    log "[root-unlock] Creating minimal $root_profile for root login-shell env overrides..."
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would create $root_profile with a basic header."
-    else
-      sudo sh -c "printf '# ~/.profile (created by %s for audio/GUI tweaks)\\n' '$SCRIPT_NAME' > '$root_profile'"
-    fi
-  fi
-  if sudo test -f "$root_profile"; then
-    if ! sudo grep -q "XDG_RUNTIME_DIR" "$root_profile"; then
-      log "[root-unlock] Adding XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $root_profile for login shells..."
-      if [[ "$dry_run" -eq 1 ]]; then
-        log "[dry-run] Would append env exports to $root_profile."
-      else
-        sudo sh -c "printf '\\n# Added by %s for audio/GUI fix\\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$root_profile'"
-      fi
-    fi
-  fi
+  done
 
   # Also write a systemd-style environment.d snippet so GUI sessions that
   # don't read shell rc files still get the right audio variables.
@@ -1960,44 +2148,21 @@ root_unlock_restore_mode() {
     log "[root-unlock-restore] systemctl not found; skipping pulseaudio.service restore."
   fi
 
-  # 4) Remove any XDG_RUNTIME_DIR export block that we previously appended to
-  # /root/.bashrc.
-  local root_bashrc="/root/.bashrc"
-  if sudo test -f "$root_bashrc"; then
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would remove XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS exports added by $SCRIPT_NAME from $root_bashrc (if present)."
-    else
-      sudo sed -i '/export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-\/run\/user\/0}/d' "$root_bashrc" 2>/dev/null || true
-      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\/run\/user\/0\/bus}/d' "$root_bashrc" 2>/dev/null || true
-      sudo sed -i '/export PULSE_SERVER=\${PULSE_SERVER:-unix:\/run\/user\//d' "$root_bashrc" 2>/dev/null || true
-      sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$root_bashrc" 2>/dev/null || true
+  # 4) Remove any XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS exports that we
+  # previously appended to root shell rc files during --root-unlock.
+  local rc
+  for rc in "${ROOT_SHELL_RC_FILES[@]}"; do
+    if sudo test -f "$rc"; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would remove XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS exports added by $SCRIPT_NAME from $rc (if present)."
+      else
+        sudo sed -i '/export XDG_RUNTIME_DIR=.*\/run\/user\/0/d' "$rc" 2>/dev/null || true
+        sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=.*unix:path=\/run\/user\/0\/bus/d' "$rc" 2>/dev/null || true
+        sudo sed -i '/export PULSE_SERVER=.*\/run\/user\//d' "$rc" 2>/dev/null || true
+        sudo sed -i '/# Added by .* for audio\/GUI fix$/d' "$rc" 2>/dev/null || true
+      fi
     fi
-  fi
-
-  # Also clean the same exports from /root/.profile and /root/.zshrc if present.
-  local root_profile="/root/.profile"
-  if sudo test -f "$root_profile"; then
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would remove env exports added by $SCRIPT_NAME from $root_profile (if present)."
-    else
-      sudo sed -i '/export XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-\\/run\\/user\\/0}/d' "$root_profile" 2>/dev/null || true
-      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\\/run\\/user\\/0\\/bus}/d' "$root_profile" 2>/dev/null || true
-      sudo sed -i '/export PULSE_SERVER=\\${PULSE_SERVER:-unix:\\/run\\/user\\//d' "$root_profile" 2>/dev/null || true
-      sudo sed -i '/# Added by .* for audio\\/GUI fix$/d' "$root_profile" 2>/dev/null || true
-    fi
-  fi
-
-  local root_zshrc="/root/.zshrc"
-  if sudo test -f "$root_zshrc"; then
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would remove env exports added by $SCRIPT_NAME from $root_zshrc (if present)."
-    else
-      sudo sed -i '/export XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-\\/run\\/user\\/0}/d' "$root_zshrc" 2>/dev/null || true
-      sudo sed -i '/export DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=\\/run\\/user\\/0\\/bus}/d' "$root_zshrc" 2>/dev/null || true
-      sudo sed -i '/export PULSE_SERVER=\\${PULSE_SERVER:-unix:\\/run\\/user\\//d' "$root_zshrc" 2>/dev/null || true
-      sudo sed -i '/# Added by .* for audio\\/GUI fix$/d' "$root_zshrc" 2>/dev/null || true
-    fi
-  fi
+  done
 
   # Remove environment.d snippet created for GUI sessions.
   local root_envd_file="/root/.config/environment.d/passwordless-fb-root-audio.conf"
@@ -2129,6 +2294,13 @@ fi
 # tweaks applied later by root_unlock_standalone_for_root.
 if [[ "$allow_root_target" -eq 1 ]]; then
   TARGET_USER="root"
+fi
+
+# Validate TARGET_USER defensively before using it in any paths or commands.
+# This guards against unexpected/malformed usernames even though we already
+# quote all variable expansions.
+if [[ ! "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  die "Invalid username format: $TARGET_USER"
 fi
 
 # Ensure target user exists.
@@ -2299,10 +2471,17 @@ log "[info] Target user: $TARGET_USER"
 
 # If running in restore mode, restore backups and exit.
 if [[ "$restore_mode" -eq 1 ]]; then
-  log "[restore] Restoring latest backups for sudoers, sudoers.d, and polkit (where present) for $TARGET_USER..."
+  log "[restore] Restoring files using manifest (if present) and known backup locations for $TARGET_USER..."
+  # First, replay the manifest so that every file we touched and registered via
+  # register_file_change is restored or removed as appropriate.
+  restore_from_manifest || true
+
+  # For backward compatibility (and for systems where only .bak.* exist), also
+  # restore the most recent backups of core sudoers/polkit files.
   restore_latest_backup_for "/etc/sudoers"
   restore_latest_backup_for "/etc/sudoers.d/${TARGET_USER}-passwordless"
   restore_latest_backup_for "/etc/polkit-1/rules.d/00-allow-${TARGET_USER}-everything.rules"
+
   log "[restore] Done. You may want to run: sudo visudo -c"
   exit 0
 fi
@@ -2405,10 +2584,16 @@ fi
 log "[3/3] Configuring polkit rule for $TARGET_USER (best-effort)..."
 
 # Prefer SUSE's polkit-default-privs mechanism when available; otherwise
-# fall back to a generic JS rule under /etc/polkit-1/rules.d.
+# fall back to legacy .pkla configuration when localauthority directories
+# exist, and finally to a generic JS rule under /etc/polkit-1/rules.d.
 if is_suse_like && have_suse_polkit_defaults; then
   if ! configure_polkit_for_user_suse; then
     warn "[polkit] SUSE-specific polkit-default-privs integration failed; falling back to JS rules."
+    configure_polkit_for_user_js || true
+  fi
+elif have_polkit_pkla_dirs; then
+  if ! configure_polkit_for_user_pkla; then
+    warn "[polkit] pkla-based polkit configuration failed; falling back to JS rules."
     configure_polkit_for_user_js || true
   fi
 else
