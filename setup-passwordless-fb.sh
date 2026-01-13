@@ -1286,8 +1286,8 @@ maybe_unlock_root_account_for_gui() {
   # Some distros ship with the root account "locked" (password field in
   # /etc/shadow starts with '!' or '*'), which can prevent GUI or TTY logins
   # from working even if everything else is configured correctly. For
-  # root-unlock usage, offer to unlock the root account so the user can log in
-  # as root if they explicitly want that.
+  # --root-unlock usage we only *report* the lock state and give guidance;
+  # we no longer unlock the account automatically.
   if [[ "$dry_run" -eq 1 ]]; then
     log "[dry-run] Would inspect /etc/shadow to see if root's password field is locked ('!' or '*')."
   fi
@@ -1312,10 +1312,11 @@ maybe_unlock_root_account_for_gui() {
   fi
 
   warn "[root-unlock] Root account appears to be LOCKED in /etc/shadow (password field begins with '!' or '*')."
-  warn "[root-unlock] Unlocking root will allow direct root logins (TTY/GUI) in addition to sudo access. Use with care."
+  warn "[root-unlock] If you want to allow direct root logins (TTY/GUI), you can unlock the account, but this is dangerous."
+  warn "[root-unlock] Be very careful: enabling direct root logins significantly increases risk."
 
   if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would prompt to run: sudo passwd -u root (or sudo passwd root if needed)."
+    log "[dry-run] Would offer to run: sudo passwd -u root (or sudo passwd root) to unlock the account."
     return 0
   fi
 
