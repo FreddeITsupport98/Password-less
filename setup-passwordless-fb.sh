@@ -104,6 +104,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --root-unlock)
       allow_root_target=1
+      # For the explicit root-unlock mode we implicitly enable --force so that
+      # existing sudoers/polkit/PAM files can be backed up and overwritten
+      # without requiring the user to add --force manually.
+      force=1
       shift
       ;;
     --all-groups)
