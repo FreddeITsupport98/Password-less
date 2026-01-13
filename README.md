@@ -161,7 +161,7 @@ chmod +x setup-passwordless-fb.sh
 Basic usage:
 
 ```bash
-./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config]
+./setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--relax-mac] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--all-groups] [--default-config]
 ```
 
 > **Important:** This is a **Bash-only** script. Run it as `./setup-passwordless-fb.sh ...` or `bash setup-passwordless-fb.sh ...`. Do **not** run it with `sh`, `dash`, or `/bin/sh`, as that may cause errors like `unbound variable` or syntax errors.
@@ -244,14 +244,18 @@ Basic usage:
   This effectively removes almost all group-based isolation between the user and system services, daemons, and device nodes.  
   Use this only if you fully understand that it turns the user into a "member of everything" and are prepared to reinstall the system if something breaks.
 
-- `--delete-passwd-on-polkit-fail`  
-  **Dangerous, optional**: when the script detects a newer polkit (for example, `polkit-1 124+`) and cannot find any existing JS `.rules` files that use `polkit.addRule` (meaning JS rules may no longer be honored), this flag allows the script to *offer* to delete the local Unix password for the target user via:
-  
-  ```bash
-  sudo passwd -d <TARGET_USER>
-  ```
-  
-  This can help keep desktop/GUI auth flows effectively passwordless even when polkit JS rules are disabled, but it also removes the traditional Unix password from that account. The script will still ask for explicit confirmation before running `passwd -d`, and respects `--dry-run`.
+- `--verify-pam-nullok`  
+-  Run a dedicated PAM inspection mode that **makes no changes**. It will:
+-  - Scan `/etc/pam.d` for `auth` lines using `pam_unix` / `pam_unix.so`.
+-  - Print each relevant line that contains either `nullok` or `nullok_secure`.
+-  - Summarize which files contain:
+-    - **bare `nullok`** (empty passwords actually accepted for that auth stack), and
+-    - **`nullok_secure`** (empty passwords restricted to secure TTYs only).
+-  - Finally, print a decision from `can_system_accept_empty_passwords()`:
+-    - **YES** if it finds at least one `auth pam_unix(.so)` line with bare `nullok` **and** no `nullok_secure` on the same line.
+-    - **NO** otherwise.
+-
+-  This is the safest way to see whether your system’s PAM stack would meaningfully honor an empty Unix password before you consider changing any passwords yourself.
 
 - `--root-unlock`  
   **Extremely dangerous, KDE-focused, experimental**: run the script in a **standalone** "root desktop unlock" mode that tweaks only the **root** account, and then exits without touching normal passwordless sudo / polkit for other users. In this mode the script will:
@@ -486,7 +490,9 @@ Before writing or relying on the JS rule, the script:
   - `/usr/lib/polkit-1/rules.d`
 
   for `.rules` files that contain `polkit.addRule`. If any are found, it assumes JS rules are still supported by the distro.
-- If **no** such JS rules are found, it marks JS rules as "maybe unsupported" and logs a warning. At that point, if you used `--delete-passwd-on-polkit-fail`, the script can optionally offer to delete the local Unix password for the target user with `passwd -d`, to keep GUI auth flows effectively passwordless even when polkit rules are ignored.
+- If **no** such JS rules are found, it marks JS rules as "maybe unsupported" and logs a warning. In this situation the script **does not** change your Unix password automatically. Instead, it advises you to:
+-  - Run `--verify-pam-nullok` (or the standalone `pam-nullok-check.sh` helper) to see whether your PAM stack actually accepts empty passwords via `pam_unix nullok`.
+-  - If, and only if, you fully understand the implications and your PAM stack is configured to honor empty passwords, you may choose to run `passwd -d <USER>` yourself to drop the local Unix password. This is always a **manual, explicit action**; the script will not run `passwd -d` for you.
 
 ### 7. Polkit Sanity Check (Best Effort)
 
@@ -662,6 +668,36 @@ sudo visudo -c
 ---
 
 ## Troubleshooting
+
+### PAM `nullok` vs `nullok_secure` and empty passwords
+
+Modern Linux PAM stacks often control whether empty passwords are accepted via options on `pam_unix`:
+
+- `nullok` – allows empty passwords for that auth stack (e.g. `system-auth`, `password-auth`).
+- `nullok_secure` – allows empty passwords **only on secure TTYs** (e.g. local console), but not for GUI/SSH/other sessions.
+
+This script uses a conservative heuristic:
+
+- It considers the system to "accept empty passwords" **only** if it finds at least one `auth pam_unix(.so)` line that:
+-  - Contains bare `nullok`, and
+-  - Does **not** contain `nullok_secure` on the same line, and
+-  - Is not commented out.
+- The mere existence of `nullok_secure` in some other file (for example `/etc/pam.d/login`) does **not** cause a global failure; it is common to use `nullok_secure` for TTY logins while using bare `nullok` for other paths.
+
+You can inspect this behavior in two ways:
+
+- `./setup-passwordless-fb.sh --verify-pam-nullok` – uses the logic embedded in the main script to:
+-  - Print all relevant `pam_unix` lines in `/etc/pam.d` containing `nullok` or `nullok_secure`.
+-  - Show a per-file summary of where **bare `nullok`** is present (empty passwords accepted) vs. where **`nullok_secure`** is present (TTY-only empty passwords).
+-  - Finally, print whether `can_system_accept_empty_passwords()` returns YES or NO.
+- `sudo bash pam-nullok-check.sh` – standalone helper script with similar semantics that you can run independently of the full setup flow.
+
+**Important:**
+
+- The script no longer deletes Unix passwords automatically under any circumstances.  
+- If you ever decide to remove your local password (e.g. `sudo passwd -d $USER`), you must:
+-  - First use the tools above to confirm your PAM stack is truly configured to honor empty passwords in the contexts you care about.
+-  - Then run `passwd -d` yourself, fully accepting the risk of lockout if your assessment is wrong.
 
 ### `sudo` still asks for a password
 

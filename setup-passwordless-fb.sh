@@ -727,6 +727,8 @@ can_system_accept_empty_passwords() {
 verify_pam_nullok_status() {
   local pam_dir="/etc/pam.d"
   local had_output=0
+  local nullok_files=()
+  local secure_files=()
 
   log "[pam-nullok] Inspecting $pam_dir for pam_unix(.so) nullok / nullok_secure..."
 
@@ -741,17 +743,28 @@ verify_pam_nullok_status() {
 
     if [[ "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
       warn "[pam-nullok] nullok_secure: $file: $line"
+      secure_files+=("$file")
       had_output=1
     fi
     if [[ "$line" =~ [[:space:]]nullok([^[:alnum:]_]|$) ]] && \
        [[ ! "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
       log "[pam-nullok] nullok:        $file: $line"
+      nullok_files+=("$file")
       had_output=1
     fi
   done < <(grep -rE '^[[:space:]]*auth.*pam_unix(\.so)?' "$pam_dir" 2>/dev/null || true)
 
   if [[ "$had_output" -eq 0 ]]; then
     log "[pam-nullok] No pam_unix(.so) auth lines found under $pam_dir."
+  else
+    # Print a short per-file summary so users can quickly see where empty
+    # passwords are actually accepted vs. limited to secure TTYs.
+    if ((${#nullok_files[@]})); then
+      printf '[pam-nullok] SUMMARY: bare nullok (empty passwords accepted) seen in: %s\n' "$(printf '%s ' "${nullok_files[@]}" | tr ' ' ',' | sed 's/,$//')"
+    fi
+    if ((${#secure_files[@]})); then
+      printf '[pam-nullok] SUMMARY: nullok_secure (TTY-only empty passwords) seen in: %s\n' "$(printf '%s ' "${secure_files[@]}" | tr ' ' ',' | sed 's/,$//')" >&2
+    fi
   fi
 
   if can_system_accept_empty_passwords; then
@@ -961,6 +974,14 @@ maybe_delete_password_for_target_user() {
   # This behavior is now deprecated/disabled: the script will *never*
   # modify your Unix password automatically. Instead, we warn and let
   # the user decide what to do manually.
+  #
+  # In practice this means:
+  #   - Use `setup-passwordless-fb.sh --verify-pam-nullok` or the
+  #     standalone `pam-nullok-check.sh` helper to see where (and
+  #     whether) pam_unix nullok is enabled on your system.
+  #   - If, after reviewing that information, you deliberately want to
+  #     drop the local Unix password (e.g. `passwd -d $USER`), you must
+  #     run that yourself. This script will not do it for you.
 
   # If polkit looks normal, nothing to do.
   if [[ "$polkit_js_maybe_unsupported" -ne 1 ]]; then
