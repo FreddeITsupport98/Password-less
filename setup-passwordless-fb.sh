@@ -30,8 +30,8 @@ Options:
   --uninstall-full-file-permissions-service
                                      Remove the systemd service/timer and config installed by --install-full-file-permissions-service
   --default-config                    Reset /etc/passwordless-fb-fullacl.conf to its default template (ACL_TARGET_USER=current user, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)
-  --root-unlock                       Standalone "root desktop unlock" mode: tweak root's audio/device groups and PulseAudio/PipeWire settings (no sudoers/polkit/PAM changes)
-  --root-unlock-restore               Attempt to undo root-unlock changes (restore /etc/pulse/client.conf backup, disable linger, show root's desktop/audio groups)
+  --root-unlock                       Target root instead of a normal user, run full sudoers/polkit/PAM setup for root, then apply extra root desktop/audio tweaks (EXTREMELY DANGEROUS)
+  --root-unlock-restore               Attempt to undo root-unlock desktop/audio changes (restore /etc/pulse/client.conf backup, disable linger, show root's desktop/audio groups)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
   --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
   -h, --help                          Show this help
@@ -62,7 +62,7 @@ uninstall_full_file_permissions_service=0
 delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
 reset_fullacl_env_to_default=0
-allow_root_target=0  # When set via --root-unlock, run a standalone "root desktop unlock" mode.
+allow_root_target=0  # When set via --root-unlock, allow TARGET_USER=root and enable extra root desktop/audio tweaks.
 root_unlock_restore=0
 ROOT_LOCK_STATE_BEFORE=""
 TARGET_USER=""
@@ -1478,10 +1478,10 @@ configure_pam_su_passwordless_for_wheel() {
 }
 
 root_unlock_standalone_for_root() {
-  # Standalone mode for --root-unlock: tweak root's group memberships and a few
+  # Helper for --root-unlock: tweak root's group memberships and a few
   # audio-related settings so a root GUI session has similar device/sound
-  # access as a normal user. No sudoers, polkit, PAM, or ACL changes are made
-  # here.
+  # access as a normal user. This helper itself does not touch sudoers,
+  # polkit, PAM, or ACLs; those are handled by the main script flow.
   local root_user="root"
   local pulse_changed=0
   local linger_changed=0
@@ -1537,7 +1537,7 @@ root_unlock_standalone_for_root() {
     fi
   fi
 
-  log "[root-unlock] Running standalone root desktop unlock mode (groups + audio config; no sudoers/polkit/PAM changes)."
+  log "[root-unlock] Running root desktop unlock helper (groups + audio config; no additional sudoers/polkit/PAM changes)."
 
   require_sudo
 
@@ -2078,10 +2078,10 @@ root_unlock_restore_mode() {
       fi
     fi
   else
-    log "[root-unlock-restore] /etc/shadow not found; cannot adjust root lock state."
+  log "[root-unlock-restore] /etc/shadow not found; cannot adjust root lock state."
   fi
 
-  log "[root-unlock-restore] Done. Sudoers/polkit/PAM were never changed by --root-unlock, so there is nothing else to restore."
+  log "[root-unlock-restore] Done. This restores root desktop/audio tweaks only; any sudoers/polkit/PAM changes for root from the main script are not modified."
 }
 
 # --- Sanity checks ---
@@ -2100,8 +2100,11 @@ if [[ "$full_file_permissions" -eq 1 ]]; then
     warn "Running as root with --full-file-permissions; proceeding with extreme caution." 
   fi
 else
-  if [[ "$(id -u)" -eq 0 ]]; then
-    die "Do not run as root. Run as the target user with sudo access (unless you are using --full-file-permissions)."
+  # Normally we refuse to run the script itself as root to avoid confusing
+  # interactions with sudo, but we make an exception for the explicit
+  # root-related helpers (--root-unlock and --root-unlock-restore).
+  if [[ "$(id -u)" -eq 0 && "$allow_root_target" -ne 1 && "$root_unlock_restore" -ne 1 ]]; then
+    die "Do not run as root. Run as the target user with sudo access (unless you are using --full-file-permissions or --root-unlock/--root-unlock-restore)."
   fi
 fi
 
@@ -2117,21 +2120,19 @@ if [[ "$root_unlock_restore" -eq 1 ]]; then
   exit 0
 fi
 
-# Standalone root-unlock mode: only tweak root's group memberships so a root
-# GUI session behaves more like a regular user for sound/devices. We do this
-# early and then exit without running the rest of the script.
+# If --root-unlock was requested, force TARGET_USER=root so root gets the same
+# sudoers/polkit/PAM configuration as a normal target user, plus extra desktop
+# tweaks applied later by root_unlock_standalone_for_root.
 if [[ "$allow_root_target" -eq 1 ]]; then
   TARGET_USER="root"
-  root_unlock_standalone_for_root
-  exit 0
 fi
 
 # Ensure target user exists.
 getent passwd "$TARGET_USER" >/dev/null 2>&1 || die "Target user '$TARGET_USER' does not exist (getent passwd failed)."
 
-# Hard stop if target is root for the normal modes.
-if [[ "$TARGET_USER" == "root" ]]; then
-  die "Refusing to configure passwordless access for root. Use --root-unlock for the limited root desktop unlock mode instead."
+# Hard stop if target is root and --root-unlock was not explicitly requested.
+if [[ "$TARGET_USER" == "root" && "$allow_root_target" -ne 1 ]]; then
+  die "Refusing to configure passwordless access for root. Use --root-unlock to target root explicitly."
 fi
 
 require_sudo
@@ -2420,6 +2421,13 @@ configure_kdesu_for_sudo
 # PAM integration: make 'su' passwordless for users in the 'wheel' group.
 log "[info] Adjusting PAM su configuration (if compatible) to allow passwordless su for wheel users..."
 configure_pam_su_passwordless_for_wheel
+
+# If we were run with --root-unlock, also apply the extra root desktop/audio
+# tweaks on top of the main passwordless configuration for root.
+if [[ "$allow_root_target" -eq 1 ]]; then
+  log "[root-unlock] Applying additional root desktop/audio tweaks after passwordless configuration for root..."
+  root_unlock_standalone_for_root
+fi
 
 if [[ "$full_file_permissions" -eq 1 ]]; then
   log "[extra] Applying full-file-permissions ACLs for $TARGET_USER on /..."
