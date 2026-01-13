@@ -20,7 +20,7 @@ SCRIPT_NAME="$(basename "$0")"
 usage() {
   cat <<'EOF'
 Usage:
-  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--root-unlock] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config]
+  setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--root-unlock] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config] [--uninstall]
 
 Options:
   --user USER                         Target USER (default: the invoking user running the script)
@@ -35,6 +35,7 @@ Options:
   --uninstall-full-file-permissions-service
                                      Remove the systemd service/timer and config installed by --install-full-file-permissions-service
   --default-config                    Reset /etc/passwordless-fb-fullacl.conf to its default template (ACL_TARGET_USER=current user, ACL_EXTRA_ARGS and ACL_ONCALENDAR defaults)
+  --uninstall                        Attempt a full uninstall using the manifest and backups (equivalent to a restore of files this script touched)
   --root-unlock                       Target root instead of a normal user, run full sudoers/polkit/PAM setup for root, then apply extra root desktop/audio tweaks (EXTREMELY DANGEROUS)
   --root-unlock-restore               Attempt to undo root-unlock desktop/audio changes (restore /etc/pulse/client.conf backup, disable linger, show root's desktop/audio groups)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
@@ -69,6 +70,7 @@ polkit_js_maybe_unsupported=0
 reset_fullacl_env_to_default=0
 allow_root_target=0  # When set via --root-unlock, allow TARGET_USER=root and enable extra root desktop/audio tweaks.
 root_unlock_restore=0
+uninstall_mode=0
 ROOT_LOCK_STATE_BEFORE=""
 TARGET_USER=""
 POLKIT_TMP=""
@@ -107,6 +109,13 @@ while [[ $# -gt 0 ]]; do
       restore_mode=1
       shift
       ;;
+    --uninstall)
+      # Treat --uninstall as a convenience wrapper around restore_mode, but
+      # keep a distinct flag so we can adjust messaging if desired.
+      restore_mode=1
+      uninstall_mode=1
+      shift
+      ;;
     --verify-only|--verify)
       verify_only=1
       shift
@@ -135,7 +144,7 @@ while [[ $# -gt 0 ]]; do
       uninstall_full_file_permissions_service=1
       shift
       ;;
-    --default-config|--defualt-config)
+    --default-config)
       reset_fullacl_env_to_default=1
       shift
       ;;
@@ -1199,7 +1208,7 @@ configure_full_file_permissions() {
     # container/overlay backends.
     log "[info] 'pv' not found. Running without progress bar (install 'pv' for progress display)..."
     "${FIND_CMD[@]}" 2>/dev/null |
-      xargs -r -d '\n' -n 100 setfacl -m "u:$TARGET_USER:rwx" \
+      xargs -r -d '\n' -n 100 setfacl -P -m "u:$TARGET_USER:rwx" \
       2> >(grep -v -E 'Operation not supported|Read-only file system|No such file or directory|Too many levels of symbolic links' >&2) || {
       warn "ACL application encountered errors or was interrupted. Some files may not have been processed."
       acl_had_errors=1
@@ -2471,7 +2480,11 @@ log "[info] Target user: $TARGET_USER"
 
 # If running in restore mode, restore backups and exit.
 if [[ "$restore_mode" -eq 1 ]]; then
-  log "[restore] Restoring files using manifest (if present) and known backup locations for $TARGET_USER..."
+  if [[ "$uninstall_mode" -eq 1 ]]; then
+    log "[uninstall] Attempting to undo changes made by this script using the manifest and backups for $TARGET_USER..."
+  else
+    log "[restore] Restoring files using manifest (if present) and known backup locations for $TARGET_USER..."
+  fi
   # First, replay the manifest so that every file we touched and registered via
   # register_file_change is restored or removed as appropriate.
   restore_from_manifest || true
@@ -2482,7 +2495,11 @@ if [[ "$restore_mode" -eq 1 ]]; then
   restore_latest_backup_for "/etc/sudoers.d/${TARGET_USER}-passwordless"
   restore_latest_backup_for "/etc/polkit-1/rules.d/00-allow-${TARGET_USER}-everything.rules"
 
-  log "[restore] Done. You may want to run: sudo visudo -c"
+  if [[ "$uninstall_mode" -eq 1 ]]; then
+    log "[uninstall] Done. You may want to run: sudo visudo -c"
+  else
+    log "[restore] Done. You may want to run: sudo visudo -c"
+  fi
   exit 0
 fi
 
