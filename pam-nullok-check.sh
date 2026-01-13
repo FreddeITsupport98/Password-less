@@ -57,7 +57,8 @@ check_pam_nullok() {
   fi
 
   if [[ "$found_nullok" -eq 1 ]]; then
-    warn "[pam-nullok] PAM RISK: at least one auth pam_unix(.so) stack appears to accept empty passwords via bare nullok."
+    warn "[pam-nullok] PAM RISK: Your system's PAM configuration includes at least one auth pam_unix(.so) stack that will accept an EMPTY PASSWORD (bare 'nullok' without 'nullok_secure')."
+    warn "[pam-nullok] This means at least one local login path is technically capable of working with no Unix password set for the account."
     return 1
   fi
 
@@ -104,7 +105,7 @@ check_sshd_empty_passwords() {
   fi
 
   if [[ "$allows_empty" -eq 1 ]]; then
-    warn "[ssh-nullok] SSHD RISK: One or more sshd_config entries allow empty passwords (PermitEmptyPasswords yes)."
+    warn "[ssh-nullok] SSHD RISK: sshd_config is explicitly configured with 'PermitEmptyPasswords yes'. Remote SSH logins could succeed with an EMPTY PASSWORD if PAM also allows it."
     return 1
   fi
 
@@ -126,11 +127,14 @@ main() {
   fi
 
   if [[ "$risk" -eq 1 ]]; then
-    warn "[overall] RISK: At least one auth path (PAM and/or SSH) appears to accept empty passwords."
+    warn "[overall] RISK: Your system is currently CAPABLE of operating with EMPTY PASSWORDS for at least one path (PAM and/or SSH)."
+    warn "[overall] In other words: if you remove the Unix password for an account, at least one login method could still succeed without prompting for a password."
+    warn "[overall] ✅ SUCCESS: This system CAN operate password-less for at least one login path. (Be absolutely sure you understand the risk.)"
     return 1
   fi
 
-  log "[overall] SAFE: Neither PAM nor SSH appear to accept empty passwords by default."
+  log "[overall] SAFE: Based on current PAM and SSH configuration, empty Unix passwords should NOT be accepted for logins by default."
+  log "[overall] ❌ FAIL: This system CANNOT be used without a Unix password by default (which is safer)."
   return 0
 }
 

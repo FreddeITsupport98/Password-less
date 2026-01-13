@@ -245,17 +245,17 @@ Basic usage:
   Use this only if you fully understand that it turns the user into a "member of everything" and are prepared to reinstall the system if something breaks.
 
 - `--verify-pam-nullok`  
--  Run a dedicated PAM inspection mode that **makes no changes**. It will:
--  - Scan `/etc/pam.d` for `auth` lines using `pam_unix` / `pam_unix.so`.
--  - Print each relevant line that contains either `nullok` or `nullok_secure`.
--  - Summarize which files contain:
--    - **bare `nullok`** (empty passwords actually accepted for that auth stack), and
--    - **`nullok_secure`** (empty passwords restricted to secure TTYs only).
--  - Finally, print a decision from `can_system_accept_empty_passwords()`:
--    - **YES** if it finds at least one `auth pam_unix(.so)` line with bare `nullok` **and** no `nullok_secure` on the same line.
--    - **NO** otherwise.
+-  Historical option name, now wired to a **combined PAM + SSH empty-password audit** that **makes no changes**. It will:
+-  - Scan `/etc/pam.d` for `auth` lines using `pam_unix` / `pam_unix.so` and detect:
+-    - **bare `nullok` without `nullok_secure`** (local auth stacks that truly accept empty passwords), and
+-    - `nullok_secure` (TTY-only empty passwords, e.g. console login).
+-  - Inspect the effective SSH server configuration (preferring `sshd -T` when available, with a text fallback) to see whether `PermitEmptyPasswords yes` is active anywhere.
+-  - Print a concise summary:
+-    - `PAM Status: ...` (SAFE or RISK),
+-    - `SSH Status: ...` (SAFE or RISK), and
+-    - a final CRITICAL/WARNING/RESULT line explaining whether empty passwords are possible **locally**, **remotely**, or both.
 -
--  This is the safest way to see whether your system’s PAM stack would meaningfully honor an empty Unix password before you consider changing any passwords yourself.
+-  This is the safest way to see whether your system’s overall auth stack (both PAM and SSH) could meaningfully honor an empty Unix password before you consider changing any passwords yourself.
 
 - `--root-unlock`  
   **Extremely dangerous, KDE-focused, experimental**: run the script in a **standalone** "root desktop unlock" mode that tweaks only the **root** account, and then exits without touching normal passwordless sudo / polkit for other users. In this mode the script will:
@@ -686,11 +686,13 @@ This script uses a conservative heuristic:
 
 You can inspect this behavior in two ways:
 
-- `./setup-passwordless-fb.sh --verify-pam-nullok` – uses the logic embedded in the main script to:
+- `./setup-passwordless-fb.sh --verify-pam-nullok` – runs the **unified PAM + SSH audit** embedded in the main script to:
 -  - Print all relevant `pam_unix` lines in `/etc/pam.d` containing `nullok` or `nullok_secure`.
 -  - Show a per-file summary of where **bare `nullok`** is present (empty passwords accepted) vs. where **`nullok_secure`** is present (TTY-only empty passwords).
--  - Finally, print whether `can_system_accept_empty_passwords()` returns YES or NO.
-- `sudo bash pam-nullok-check.sh` – standalone helper script with similar semantics that you can run independently of the full setup flow.
+-  - Inspect the effective SSH configuration (via `sshd -T` when possible, with a text fallback) to detect any `PermitEmptyPasswords yes` settings.
+-  - Summarize results as `PAM Status`, `SSH Status`, and a final CRITICAL/WARNING/RESULT line.
+-
+- `sudo bash pam-nullok-check.sh` – standalone helper script with similar semantics focused primarily on PAM (with its own SSH awareness) that you can run independently of the full setup flow.
 
 **Important:**
 

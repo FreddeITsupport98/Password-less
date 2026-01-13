@@ -64,7 +64,7 @@ restore_mode=0
 verify_only=0
 relax_mac=0
 full_file_permissions=0
-verify_pam_nullok_only=0
+verify_empty_pw_only=0
 all_groups=0
 install_full_file_permissions_service=0
 uninstall_full_file_permissions_service=0
@@ -123,7 +123,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --verify-pam-nullok)
-      verify_pam_nullok_only=1
+      # Historical name; now runs the combined PAM + SSH empty-password audit.
+      verify_empty_pw_only=1
       shift
       ;;
     --full-file-permissions)
@@ -724,53 +725,71 @@ can_system_accept_empty_passwords() {
   return 1
 }
 
-verify_pam_nullok_status() {
-  local pam_dir="/etc/pam.d"
-  local had_output=0
-  local nullok_files=()
-  local secure_files=()
+check_sshd_config_allows_empty() {
+  # Returns 0 (true) if SSH allows empty passwords.
+  # Returns 1 (false) if SSH blocks them (default) or is missing.
+  local ssh_config_roots=("/etc/ssh/sshd_config" "/etc/ssh/sshd_config.d")
 
-  log "[pam-nullok] Inspecting $pam_dir for pam_unix(.so) nullok / nullok_secure..."
-
-  # Print all relevant lines, distinguishing between nullok and
-  # nullok_secure on a per-line basis.
-  while IFS=: read -r file line; do
-    [[ -z "$line" ]] && continue
-
-    if [[ "$line" =~ ^[[:space:]]*# ]]; then
-      continue
+  # Best-effort: ask sshd directly (resolves Include/overrides).
+  if [[ $EUID -eq 0 ]] && command -v sshd >/dev/null 2>&1; then
+    if sshd -T 2>/dev/null | grep -q '^permitemptypasswords yes'; then
+      return 0
     fi
-
-    if [[ "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
-      warn "[pam-nullok] nullok_secure: $file: $line"
-      secure_files+=("$file")
-      had_output=1
-    fi
-    if [[ "$line" =~ [[:space:]]nullok([^[:alnum:]_]|$) ]] && \
-       [[ ! "$line" =~ nullok_secure([^[:alnum:]_]|$) ]]; then
-      log "[pam-nullok] nullok:        $file: $line"
-      nullok_files+=("$file")
-      had_output=1
-    fi
-  done < <(grep -rE '^[[:space:]]*auth.*pam_unix(\.so)?' "$pam_dir" 2>/dev/null || true)
-
-  if [[ "$had_output" -eq 0 ]]; then
-    log "[pam-nullok] No pam_unix(.so) auth lines found under $pam_dir."
-  else
-    # Print a short per-file summary so users can quickly see where empty
-    # passwords are actually accepted vs. limited to secure TTYs.
-    if ((${#nullok_files[@]})); then
-      printf '[pam-nullok] SUMMARY: bare nullok (empty passwords accepted) seen in: %s\n' "$(printf '%s ' "${nullok_files[@]}" | tr ' ' ',' | sed 's/,$//')"
-    fi
-    if ((${#secure_files[@]})); then
-      printf '[pam-nullok] SUMMARY: nullok_secure (TTY-only empty passwords) seen in: %s\n' "$(printf '%s ' "${secure_files[@]}" | tr ' ' ',' | sed 's/,$//')" >&2
+    # If sshd -T succeeds and did not report yes, treat as NO.
+    if sshd -T >/dev/null 2>&1; then
+      return 1
     fi
   fi
 
+  # Fallback: static text search, ignoring comments.
+  if grep -rE '^[[:space:]]*PermitEmptyPasswords[[:space:]]+yes' "${ssh_config_roots[@]}" 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+verify_empty_password_status() {
+  local pam_status="SAFE"
+  local ssh_status="SAFE"
+  local overall_risk=0
+
+  log "[audit] Checking PAM and SSH configuration for empty password risks..."
+
+  # --- 1. Check PAM ---
   if can_system_accept_empty_passwords; then
-    log "[pam-nullok] RESULT: can_system_accept_empty_passwords() -> YES (system appears willing to accept empty passwords via pam_unix nullok)."
+    pam_status="RISK (nullok present)"
+    warn "[audit] PAM: Found bare 'nullok' directive without 'nullok_secure'. At least one local auth path can accept an EMPTY PASSWORD."
+    overall_risk=1
   else
-    log "[pam-nullok] RESULT: can_system_accept_empty_passwords() -> NO (system does NOT appear safe for empty passwords)."
+    log "[audit] PAM: No bare 'nullok' lines without 'nullok_secure' found. PAM appears to reject empty passwords."
+  fi
+
+  # --- 2. Check SSH ---
+  if check_sshd_config_allows_empty; then
+    ssh_status="RISK (PermitEmptyPasswords yes)"
+    warn "[audit] SSH: 'PermitEmptyPasswords yes' is active in the effective sshd configuration. Remote SSH logins could accept EMPTY PASSWORDS if PAM allows it."
+    overall_risk=1
+  else
+    log "[audit] SSH: 'PermitEmptyPasswords' is not explicitly set to yes. Remote empty passwords are blocked by SSH."
+  fi
+
+  # --- 3. Summary ---
+  echo "----------------------------------------------------------------"
+  printf 'PAM Status: %s\n' "$pam_status"
+  printf 'SSH Status: %s\n' "$ssh_status"
+  echo "----------------------------------------------------------------"
+
+  if [[ "$overall_risk" -eq 1 ]]; then
+    if [[ "$pam_status" == *"RISK"* && "$ssh_status" == *"RISK"* ]]; then
+      warn "[audit] CRITICAL: System allows empty passwords BOTH locally (PAM) and remotely (SSH)."
+    elif [[ "$pam_status" == *"RISK"* ]]; then
+      warn "[audit] WARNING: System allows empty passwords LOCALLY (e.g. TTY/su), but SSH is still blocking them."
+    else
+      warn "[audit] WARNING: SSH is configured to allow empty passwords, but PAM appears to reject them."
+    fi
+  else
+    log "[audit] RESULT: System appears secure against empty passwords at both PAM and SSH levels."
   fi
 }
 
@@ -2388,9 +2407,9 @@ root_unlock_restore_mode() {
   log "[root-unlock-restore] Done. This restores root desktop/audio tweaks only; any sudoers/polkit/PAM changes for root from the main script are not modified."
 }
 
-# If asked to only verify the PAM nullok configuration, do that first and exit.
-if [[ "$verify_pam_nullok_only" -eq 1 ]]; then
-  verify_pam_nullok_status
+# If asked to only verify the PAM/SSH empty-password configuration, do that first and exit.
+if [[ "$verify_empty_pw_only" -eq 1 ]]; then
+  verify_empty_password_status
   exit 0
 fi
 
