@@ -39,11 +39,13 @@ Options:
   --root-unlock                       Target root instead of a normal user, run full sudoers/polkit/PAM setup for root, then apply extra root desktop/audio tweaks (EXTREMELY DANGEROUS)
   --root-unlock-restore               Attempt to undo root-unlock desktop/audio changes (restore /etc/pulse/client.conf backup, disable linger, show root's desktop/audio groups)
   --all-groups                        Add TARGET_USER to **every** group returned by `getent group` (except those they already have); extremely dangerous
-  --delete-passwd-on-polkit-fail      When polkit appears to use a newer/unsupported JS rule engine (e.g. polkit >= 124), optionally delete the local password for TARGET_USER via `passwd -d` after polkit configuration, to keep GUI auth flows effectively passwordless (still requires explicit confirmation)
+  # (Deprecated) Previously: --delete-passwd-on-polkit-fail
   -h, --help                          Show this help
 
 Notes:
-  - Run as a normal user with sudo access (do NOT run as root).
+  - For normal usage, run as a non-root user with sudo access (do NOT run the script itself as root).
+  - The following modes MUST be run as root (for example: sudo bash setup-passwordless-fb.sh --root-unlock or --root-unlock-restore, and --full-file-permissions):
+      --root-unlock, --root-unlock-restore, --full-file-permissions
   - Some distros ship polkit >= 124 where JavaScript rules are disabled/removed.
     In that case, this script will configure sudo but will only attempt polkit with a warning.
 EOF
@@ -62,10 +64,10 @@ restore_mode=0
 verify_only=0
 relax_mac=0
 full_file_permissions=0
+verify_pam_nullok_only=0
 all_groups=0
 install_full_file_permissions_service=0
 uninstall_full_file_permissions_service=0
-delete_passwd_on_polkit_fail=0
 polkit_js_maybe_unsupported=0
 reset_fullacl_env_to_default=0
 allow_root_target=0  # When set via --root-unlock, allow TARGET_USER=root and enable extra root desktop/audio tweaks.
@@ -120,6 +122,10 @@ while [[ $# -gt 0 ]]; do
       verify_only=1
       shift
       ;;
+    --verify-pam-nullok)
+      verify_pam_nullok_only=1
+      shift
+      ;;
     --full-file-permissions)
       full_file_permissions=1
       shift
@@ -150,10 +156,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --root-unlock-restore)
       root_unlock_restore=1
-      shift
-      ;;
-    --delete-passwd-on-polkit-fail)
-      delete_passwd_on_polkit_fail=1
       shift
       ;;
     --yes)
@@ -208,6 +210,13 @@ files_identical_as_root() {
 }
 
 require_sudo() {
+  # When the script itself is being run as root (e.g. for --full-file-permissions
+  # or --root-unlock/--root-unlock-restore), we do not need to refresh a sudo
+  # timestamp.
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return 0
+  fi
+
   have_cmd sudo || die "sudo not found. Install sudo and re-run (or run with --no-install after installing)."
   log "[sanity] Refreshing sudo timestamp (you may be prompted once)..."
   sudo -v
@@ -666,6 +675,87 @@ have_polkit_pkla_dirs() {
   return 1
 }
 
+can_system_accept_empty_passwords() {
+  # Heuristic check whether the PAM stack appears to allow empty passwords
+  # via pam_unix.so with the "nullok" option.
+  #
+  # This does *not* guarantee a specific login path will accept an empty
+  # password, but if we see no evidence of nullok at all, then running
+  # "passwd -d" is much more likely to result in a locked / unusable
+  # account instead of a truly passwordless one.
+
+  # If pam_unix.so is only configured with nullok_secure, treat that as
+  # effectively "no" for our purposes (it's typically limited to very
+  # restricted TTYs).
+  if grep -rEq '^[[:space:]]*auth.*pam_unix\.so.*nullok_secure' /etc/pam.d 2>/dev/null; then
+    warn "[pam-nullok] Found pam_unix.so with nullok_secure in /etc/pam.d; treating system as NOT safe for empty passwords."
+    return 1
+  fi
+
+  # Look for a pam_unix.so auth line with "nullok" (but not nullok_secure).
+  # For easier debugging, log the first matching location when we find one.
+  local first_match
+  first_match=$(grep -rEn '^[[:space:]]*auth.*pam_unix\\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null | head -n1 || true)
+  if [[ -n "$first_match" ]]; then
+    log "[pam-nullok] Detected pam_unix.so with nullok on auth line: $first_match"
+    return 0
+  fi
+
+  log "[pam-nullok] No pam_unix.so auth line with nullok found under /etc/pam.d; treating system as NOT safe for empty passwords."
+  return 1
+}
+
+verify_pam_nullok_status() {
+  log "[pam-nullok] Inspecting /etc/pam.d for pam_unix.so nullok / nullok_secure..."
+
+  if grep -rEn '^[[:space:]]*auth.*pam_unix\.so.*nullok_secure' /etc/pam.d 2>/dev/null; then
+    warn "[pam-nullok] Above lines show pam_unix.so with nullok_secure (treated as NOT safe for empty passwords)."
+  else
+    log "[pam-nullok] No pam_unix.so auth line with nullok_secure found."
+  fi
+
+  if grep -rEn '^[[:space:]]*auth.*pam_unix\.so.*nullok(([^_[:alnum:]]|$))' /etc/pam.d 2>/dev/null; then
+    log "[pam-nullok] Above lines show pam_unix.so auth entries with nullok (without nullok_secure)."
+  else
+    log "[pam-nullok] No pam_unix.so auth line with bare nullok found."
+  fi
+
+  if can_system_accept_empty_passwords; then
+    log "[pam-nullok] RESULT: can_system_accept_empty_passwords() -> YES (system appears willing to accept empty passwords via pam_unix nullok)."
+  else
+    log "[pam-nullok] RESULT: can_system_accept_empty_passwords() -> NO (system does NOT appear safe for empty passwords)."
+  fi
+}
+
+check_user_password_status() {
+  # After running `passwd -d`, inspect the account status to see whether
+  # the password really ended up empty (NP) or locked (L/LK/etc.). This is
+  # best-effort and only used for logging; it does not change behavior.
+  local user="$1"
+
+  if ! have_cmd passwd; then
+    return 0
+  fi
+
+  local status
+  status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
+
+  case "$status" in
+    NP)
+      log "[polkit] Account '$user' is reported by passwd -S as having no password (status=NP)."
+      ;;
+    L|LK)
+      warn "[polkit] Account '$user' appears LOCKED after passwd -d (status=$status). Empty-password logins will not work."
+      ;;
+    "")
+      warn "[polkit] Could not determine password status for '$user' via passwd -S."
+      ;;
+    *)
+      warn "[polkit] Account '$user' status after passwd -d is '$status' (not NP). Behavior may not be passwordless."
+      ;;
+  esac
+}
+
 configure_polkit_for_user_suse() {
   # Best-effort integration with SUSE's polkit-default-privs mechanism.
   # We avoid editing JS rules directly when a distro-specific mechanism
@@ -830,43 +920,24 @@ EOF
 }
 
 maybe_delete_password_for_target_user() {
-  # Optionally delete the local Unix password for TARGET_USER via `passwd -d`
-  # when polkit JS rules appear unsupported (e.g. polkit >= 124).
-  # This is guarded behind the --delete-passwd-on-polkit-fail flag and an
-  # additional confirmation prompt.
+  # Historically, this function could delete the local Unix password for
+  # TARGET_USER via `passwd -d` when polkit JS rules appeared unsupported
+  # (e.g. polkit >= 124), guarded behind --delete-passwd-on-polkit-fail.
+  #
+  # This behavior is now deprecated/disabled: the script will *never*
+  # modify your Unix password automatically. Instead, we warn and let
+  # the user decide what to do manually.
 
   # If polkit looks normal, nothing to do.
   if [[ "$polkit_js_maybe_unsupported" -ne 1 ]]; then
     return 0
   fi
 
-  # Always inform the user when we think JS rules may not be honored.
   warn "Polkit appears to be using a newer JS engine (e.g. polkit >= 124) where JS rules may not be honored."
+  warn "This script will NOT run 'passwd -d' or change the Unix password for '$TARGET_USER' automatically."
+  warn "If you want GUI auth flows to be passwordless as well, you must deliberately adjust your PAM configuration and/or password yourself (for example via 'passwd -d' after confirming your stack supports pam_unix nullok). Use 'setup-passwordless-fb.sh --verify-pam-nullok' or 'pam-nullok-check.sh' to inspect your PAM configuration first."
 
-  # If the flag was *not* provided, just warn and suggest what to do, but
-  # do not change any passwords automatically.
-  if [[ "$delete_passwd_on_polkit_fail" -ne 1 ]]; then
-    warn "You did NOT pass --delete-passwd-on-polkit-fail. If you also want to drop the local Unix password for '$TARGET_USER' to keep GUI auth flows passwordless, re-run this script with that flag enabled (see README for details), or adjust the password manually. This is **dangerous** and can lock you out if you do not have another way to log in (e.g. SSH keys, another admin user, or root console). Use at your own risk."
-    return 0
-  fi
-
-  warn "You enabled --delete-passwd-on-polkit-fail, which allows this script to delete the local password for '$TARGET_USER' to keep GUI auth flows effectively passwordless. This is **dangerous** and may lock you out of local logins if you rely on a Unix password for this account. Proceed only if you fully understand the consequences."
-
-  if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would run: sudo passwd -d $TARGET_USER"
-    return 0
-  fi
-
-  if ! confirm "Delete the local password for '$TARGET_USER' by running 'sudo passwd -d $TARGET_USER'?"; then
-    log "[info] Skipping password deletion for $TARGET_USER."
-    return 0
-  fi
-
-  if ! sudo passwd -d "$TARGET_USER"; then
-    warn "[polkit] Failed to delete password for $TARGET_USER via passwd -d."
-  else
-    log "[polkit] Deleted local password for $TARGET_USER via passwd -d (account now has no Unix password)."
-  fi
+  return 0
 }
 
 relax_mac_controls_if_requested() {
@@ -2262,6 +2333,12 @@ root_unlock_restore_mode() {
   log "[root-unlock-restore] Done. This restores root desktop/audio tweaks only; any sudoers/polkit/PAM changes for root from the main script are not modified."
 }
 
+# If asked to only verify the PAM nullok configuration, do that first and exit.
+if [[ "$verify_pam_nullok_only" -eq 1 ]]; then
+  verify_pam_nullok_status
+  exit 0
+fi
+
 # --- Sanity checks ---
 # For the extremely dangerous, **experimental** --full-file-permissions mode,
 # we require the script itself to be run as root so we do not need to invoke
@@ -2278,11 +2355,25 @@ if [[ "$full_file_permissions" -eq 1 ]]; then
     warn "Running as root with --full-file-permissions; proceeding with extreme caution." 
   fi
 else
-  # Normally we refuse to run the script itself as root to avoid confusing
-  # interactions with sudo, but we make an exception for the explicit
-  # root-related helpers (--root-unlock and --root-unlock-restore).
-  if [[ "$(id -u)" -eq 0 && "$allow_root_target" -ne 1 && "$root_unlock_restore" -ne 1 ]]; then
-    die "Do not run as root. Run as the target user with sudo access (unless you are using --full-file-permissions or --root-unlock/--root-unlock-restore)."
+  # For all other modes, enforce the following:
+  #   - --root-unlock and --root-unlock-restore MUST be run as root.
+  #   - Normal usage must NOT be run as root.
+  uid="$(id -u)"
+
+  if [[ "$allow_root_target" -eq 1 || "$root_unlock_restore" -eq 1 ]]; then
+    if [[ "$uid" -ne 0 ]]; then
+      if [[ "$allow_root_target" -eq 1 && "$root_unlock_restore" -eq 1 ]]; then
+        die "--root-unlock and --root-unlock-restore must be run as root. Re-run via: sudo bash $SCRIPT_NAME --root-unlock [--root-unlock-restore]"
+      elif [[ "$allow_root_target" -eq 1 ]]; then
+        die "--root-unlock must be run as root. Re-run via: sudo bash $SCRIPT_NAME --root-unlock"
+      else
+        die "--root-unlock-restore must be run as root. Re-run via: sudo bash $SCRIPT_NAME --root-unlock-restore"
+      fi
+    fi
+  else
+    if [[ "$uid" -eq 0 ]]; then
+      die "Do not run as root. Run as the target user with sudo access (unless you are using --full-file-permissions or --root-unlock/--root-unlock-restore)."
+    fi
   fi
 fi
 
