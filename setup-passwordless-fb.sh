@@ -1942,62 +1942,79 @@ root_unlock_standalone_for_root() {
 
   # 2) PulseAudio: allow root to autospawn its own server. Only do this when
   # the audio stack appears to be PulseAudio-compatible.
-  local pulse_client="/etc/pulse/client.conf"
+  #
+  # To make this more resilient against KDE / distro updates that may replace
+  # /etc/pulse/client.conf, prefer a per-user config under /root/.config/pulse
+  # instead of tweaking the system-wide file.
+  local pulse_client_root="/root/.config/pulse/client.conf"
+  local pulse_client_system="/etc/pulse/client.conf"
   local tmp_pulse
 
   if [[ "$audio_stack" != "pulseaudio" && "$audio_stack" != "pipewire-pulse" && "$audio_stack" != "unknown" ]]; then
-    log "[root-unlock] Skipping /etc/pulse/client.conf tweaks (audio stack '$audio_stack' does not look PulseAudio-compatible)."
+    log "[root-unlock] Skipping PulseAudio client.conf tweaks (audio stack '$audio_stack' does not look PulseAudio-compatible)."
   else
     if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would ensure allow-autospawn-for-root = yes and autospawn = yes in $pulse_client."
+      log "[dry-run] Would ensure allow-autospawn-for-root = yes and autospawn = yes in $pulse_client_root (per-user root PulseAudio config)."
     fi
 
-    if sudo test -e "$pulse_client"; then
+    # Ensure the per-user PulseAudio config directory exists for root.
     if [[ "$dry_run" -eq 1 ]]; then
-      : # already logged above
+      log "[dry-run] Would create /root/.config/pulse if it does not exist."
     else
-      # Make a timestamped backup of the existing client.conf so
-      # --root-unlock-restore can put it back later.
-      backup_if_exists "$pulse_client"
-      # If the key exists (commented or not), normalize it; otherwise append.
-      if sudo grep -Eq '^[[:space:]]*allow-autospawn-for-root' "$pulse_client"; then
-        sudo sed -i 's/^[[:space:]]*allow-autospawn-for-root.*/allow-autospawn-for-root = yes/' "$pulse_client" || \
-          warn "[root-unlock] Failed to update allow-autospawn-for-root in $pulse_client via sed."
-      else
-        sudo sh -c "printf '\n# Added by %s for root desktop audio\nallow-autospawn-for-root = yes\n' '$SCRIPT_NAME' >> '$pulse_client'" || \
-          warn "[root-unlock] Failed to append allow-autospawn-for-root entry to $pulse_client."
-      fi
-
-      # Also ensure the global autospawn switch is enabled so the setting above
-      # actually takes effect.
-      if sudo grep -Eq '^[[:space:]]*autospawn' "$pulse_client"; then
-        sudo sed -i 's/^[[:space:]]*autospawn.*/autospawn = yes/' "$pulse_client" || \
-          warn "[root-unlock] Failed to update autospawn = yes in $pulse_client via sed."
-      else
-        sudo sh -c "echo 'autospawn = yes' >> '$pulse_client'" || \
-          warn "[root-unlock] Failed to append autospawn = yes to $pulse_client."
-      fi
-
-      log "[root-unlock] Ensured allow-autospawn-for-root = yes and autospawn = yes in $pulse_client."
-      pulse_changed=1
+      sudo mkdir -p /root/.config/pulse
     fi
-  else
-    # No client.conf: create a minimal one.
-    tmp_pulse="$(mktemp)"
-    cat >"$tmp_pulse" <<EOF
+
+    if sudo test -e "$pulse_client_root"; then
+      if [[ "$dry_run" -eq 1 ]]; then
+        : # already logged above
+      else
+        # Make a backup of the existing per-user client.conf so
+        # --root-unlock-restore (or manual recovery) can put it back later.
+        backup_if_exists "$pulse_client_root"
+        # If the key exists (commented or not), normalize it; otherwise append.
+        if sudo grep -Eq '^[[:space:]]*allow-autospawn-for-root' "$pulse_client_root"; then
+          sudo sed -i 's/^[[:space:]]*allow-autospawn-for-root.*/allow-autospawn-for-root = yes/' "$pulse_client_root" || \
+            warn "[root-unlock] Failed to update allow-autospawn-for-root in $pulse_client_root via sed."
+        else
+          sudo sh -c "printf '\n# Added by %s for root desktop audio\nallow-autospawn-for-root = yes\n' '$SCRIPT_NAME' >> '$pulse_client_root'" || \
+            warn "[root-unlock] Failed to append allow-autospawn-for-root entry to $pulse_client_root."
+        fi
+
+        # Also ensure the global autospawn switch is enabled so the setting above
+        # actually takes effect.
+        if sudo grep -Eq '^[[:space:]]*autospawn' "$pulse_client_root"; then
+          sudo sed -i 's/^[[:space:]]*autospawn.*/autospawn = yes/' "$pulse_client_root" || \
+            warn "[root-unlock] Failed to update autospawn = yes in $pulse_client_root via sed."
+        else
+          sudo sh -c "echo 'autospawn = yes' >> '$pulse_client_root'" || \
+            warn "[root-unlock] Failed to append autospawn = yes to $pulse_client_root."
+        fi
+
+        log "[root-unlock] Ensured allow-autospawn-for-root = yes and autospawn = yes in $pulse_client_root."
+        pulse_changed=1
+      fi
+    else
+      # No per-user client.conf for root: create a minimal one.
+      tmp_pulse="$(mktemp)"
+      cat >"$tmp_pulse" <<EOF
 # Generated by $SCRIPT_NAME for root desktop audio
 autospawn = yes
 allow-autospawn-for-root = yes
 EOF
-    if [[ "$dry_run" -eq 1 ]]; then
-      log "[dry-run] Would install new $pulse_client with autospawn = yes and allow-autospawn-for-root = yes."
-    else
-      write_root_file "$tmp_pulse" "$pulse_client" 0644
-      log "[root-unlock] Created $pulse_client with autospawn = yes and allow-autospawn-for-root = yes."
+      if [[ "$dry_run" -eq 1 ]]; then
+        log "[dry-run] Would install new $pulse_client_root with autospawn = yes and allow-autospawn-for-root = yes."
+      else
+        write_root_file "$tmp_pulse" "$pulse_client_root" 0644
+        log "[root-unlock] Created $pulse_client_root with autospawn = yes and allow-autospawn-for-root = yes."
+      fi
+      rm -f "$tmp_pulse" 2>/dev/null || true
+      pulse_changed=1
     fi
-    rm -f "$tmp_pulse" 2>/dev/null || true
-    pulse_changed=1
-  fi
+
+    # For backwards compatibility, if a system-wide /etc/pulse/client.conf exists
+    # and we have not touched it before, leave it alone. Root's per-user
+    # client.conf will take precedence and should survive KDE / PulseAudio
+    # package updates.
   fi  # end PulseAudio compatibility guard
 
   # 3) WirePlumber/PipeWire: allow root to run its own user instance even on
@@ -2053,7 +2070,7 @@ EOF
     local ts
     ts="$(date +%Y%m%d-%H%M%S)"
     local p
-    for p in /root/.config/pulse /root/.config/pipewire /root/.local/state/wireplumber; do
+    for p in /root/.config/pipewire /root/.local/state/wireplumber; do
       if sudo test -e "$p"; then
         local bak="${p}.bak.${ts}"
         sudo mv "$p" "$bak" 2>/dev/null || true
@@ -2146,7 +2163,11 @@ EOF
         if [[ "$dry_run" -eq 1 ]]; then
           log "[dry-run] Would append env exports for XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS to $rc."
         else
-          sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$rc'"
+          sudo tee -a "$rc" >/dev/null <<'EOF'
+# Added by setup-passwordless-fb.sh for audio/GUI fix
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
+export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}
+EOF
         fi
       fi
     fi
@@ -2180,7 +2201,11 @@ EOF
       if [[ "$dry_run" -eq 1 ]]; then
         log "[dry-run] Would append env exports to $root_zshrc."
       else
-        sudo sh -c "printf '\n# Added by %s for audio/GUI fix\nexport XDG_RUNTIME_DIR=\\${XDG_RUNTIME_DIR:-/run/user/0}\\nexport DBUS_SESSION_BUS_ADDRESS=\\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}\\n' '$SCRIPT_NAME' >> '$root_zshrc'"
+        sudo tee -a "$root_zshrc" >/dev/null <<'EOF'
+# Added by setup-passwordless-fb.sh for audio/GUI fix
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/0}
+export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/0/bus}
+EOF
       fi
     fi
   fi
