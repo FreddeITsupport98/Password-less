@@ -119,6 +119,7 @@ If you do not fully understand or accept these risks, **do not run this script**
   - Uses `visudo` to validate **temporary files** before installing them
   - Backs up existing files with timestamped `.bak.<timestamp>` suffix when overwriting (only when `--force` is used)
   - Refuses to do unsafe things by default (e.g. doesn’t overwrite existing config unless you explicitly ask it to)
+  - Auto-detects and (only when needed) patches a known `gdebi-gtk` pkexec GUI display-environment issue, with `.orig` backup and manifest-based restore compatibility
 
 ---
 

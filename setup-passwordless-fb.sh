@@ -376,8 +376,12 @@ restore_latest_backup_for() {
   # created by older versions of this script.
   local path="$1"
   local orig="${path}.orig"
-  local pattern
-  local latest
+  local latest=""
+  local backup_dir
+  local backup_base
+  local candidate
+  local candidate_mtime
+  local latest_mtime=0
 
   if sudo test -e "$orig"; then
     if [[ "$dry_run" -eq 1 ]]; then
@@ -389,10 +393,17 @@ restore_latest_backup_for() {
     return 0
   fi
 
-  pattern="${path}.bak.*"
-  latest="$(ls -1t $pattern 2>/dev/null | head -n1 || true)"
+  backup_dir="$(dirname "$path")"
+  backup_base="$(basename "$path").bak."
+  while IFS= read -r -d '' candidate; do
+    candidate_mtime="$(sudo stat -c '%Y' "$candidate" 2>/dev/null || echo 0)"
+    if [[ "$candidate_mtime" -gt "$latest_mtime" ]]; then
+      latest_mtime="$candidate_mtime"
+      latest="$candidate"
+    fi
+  done < <(sudo find "$backup_dir" -maxdepth 1 -type f -name "${backup_base}*" -print0 2>/dev/null)
   if [[ -z "$latest" ]]; then
-    log "[restore] No backups found for $path (pattern: $pattern); skipping."
+    log "[restore] No backups found for $path (pattern: ${path}.bak.*); skipping."
     return 0
   fi
 
@@ -1569,10 +1580,10 @@ EOF
   # Determine the desired schedule from the env file (if present).
   local schedule="daily"
   if [[ -f "$env_path" ]]; then
-    # shellcheck disable=SC1090
     # Temporarily disable set -u while sourcing the env file so that
     # user edits that reference unset variables do not abort the script.
     set +u
+    # shellcheck disable=SC1090
     . "$env_path" || true
     set -u
     if [[ -n "${ACL_ONCALENDAR:-}" ]]; then
@@ -1626,6 +1637,132 @@ configure_kdesu_for_sudo() {
     if ! kwriteconfig5 --file kdesurc --group super-user-command --key super-user-command sudo; then
       warn "Failed to configure kdesu to use sudo via kwriteconfig5"
     fi
+  fi
+}
+
+patch_gdebi_pkexec_display_env_if_needed() {
+  # Detect and patch a known GDebi issue where pkexec relaunch loses GUI
+  # session environment variables and crashes with:
+  #   "Can't create a GtkStyleContext without a display connection"
+  #
+  # This patch is additive and idempotent:
+  # - If already patched, it does nothing.
+  # - If an unexpected GDebi layout is detected, it skips safely.
+  # - If patched, it stores a .orig backup and registers it in the manifest so
+  #   --restore / --uninstall can roll it back.
+  local gdebi_py="/usr/share/gdebi/GDebi/GDebiGtk.py"
+  local tmp
+  local patch_rc=0
+
+  # If gdebi is not installed, nothing to do.
+  if ! sudo test -f "$gdebi_py"; then
+    log "[gdebi-fix] $gdebi_py not found; skipping display-env compatibility patch."
+    return 0
+  fi
+
+  # Detect already-patched content first.
+  if sudo grep -Fq 'gdebi_args = ["env"] + env_args + [' "$gdebi_py" && \
+     sudo grep -Fq 'env_keys = (' "$gdebi_py"; then
+    log "[gdebi-fix] Patch already present in $gdebi_py; no change needed."
+    return 0
+  fi
+
+  # Detect unpatched layout we know how to modify safely.
+  if ! sudo grep -Fq 'gdebi_args = ["gdebi-gtk", "--non-interactive",' "$gdebi_py"; then
+    warn "[gdebi-fix] Unsupported GDebi layout detected in $gdebi_py; skipping auto-patch to avoid unsafe edits."
+    return 0
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would patch $gdebi_py to preserve DISPLAY/Wayland/DBUS environment through pkexec."
+    return 0
+  fi
+
+  have_cmd python3 || {
+    warn "[gdebi-fix] python3 not found; cannot apply safe in-place patch to $gdebi_py."
+    return 0
+  }
+
+  tmp="$(mktemp)"
+  if ! sudo cp "$gdebi_py" "$tmp"; then
+    rm -f "$tmp" 2>/dev/null || true
+    warn "[gdebi-fix] Failed to copy $gdebi_py to a temporary file; skipping patch."
+    return 0
+  fi
+
+  if python3 - "$tmp" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+
+old = """            gdebi_args = [\"gdebi-gtk\", \"--non-interactive\",
+                          self._deb.filename]
+"""
+
+new = """            env_keys = (
+                \"DISPLAY\",
+                \"XAUTHORITY\",
+                \"WAYLAND_DISPLAY\",
+                \"XDG_RUNTIME_DIR\",
+                \"DBUS_SESSION_BUS_ADDRESS\",
+                \"XDG_SESSION_TYPE\",
+                \"GDK_BACKEND\",
+                \"QT_QPA_PLATFORM\",
+            )
+            env_args = []
+            for key in env_keys:
+                value = os.environ.get(key)
+                if value:
+                    env_args.append(\"%s=%s\" % (key, value))
+            gdebi_args = [\"env\"] + env_args + [
+                \"gdebi-gtk\", \"--non-interactive\", self._deb.filename
+            ]
+"""
+
+if old not in text:
+    sys.exit(42)
+
+text = text.replace(old, new, 1)
+path.write_text(text, encoding="utf-8")
+PY
+  then
+    :
+  else
+    patch_rc=$?
+    rm -f "$tmp" 2>/dev/null || true
+    if [[ "$patch_rc" -eq 42 ]]; then
+      warn "[gdebi-fix] Expected unpatched block was not found during patching; file may already be modified. Skipping."
+    else
+      warn "[gdebi-fix] Failed to patch $gdebi_py (python exit=$patch_rc); skipping."
+    fi
+    return 0
+  fi
+
+  if ! python3 -m py_compile "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp" 2>/dev/null || true
+    warn "[gdebi-fix] Patched temporary file failed python syntax check; not installing patch."
+    return 0
+  fi
+
+  # Keep a stable backup and register it in the uninstall manifest.
+  if ! sudo test -e "${gdebi_py}.orig"; then
+    sudo cp -a "$gdebi_py" "${gdebi_py}.orig"
+    register_file_change "$gdebi_py" "${gdebi_py}.orig"
+  fi
+
+  if ! sudo install -o root -g root -m 0644 "$tmp" "$gdebi_py"; then
+    rm -f "$tmp" 2>/dev/null || true
+    warn "[gdebi-fix] Failed to install patched $gdebi_py; leaving original file unchanged."
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+
+  if python3 -m py_compile "$gdebi_py" >/dev/null 2>&1; then
+    log "[gdebi-fix] Patched $gdebi_py and verified syntax."
+  else
+    warn "[gdebi-fix] Patch installed, but post-install syntax check failed for $gdebi_py."
   fi
 }
 
@@ -1752,7 +1889,7 @@ configure_pam_su_passwordless_for_wheel() {
       # Build a new file with the injected pam_wheel line after pam_rootok.so.
       local injected
       injected="$(mktemp)"
-      sudo awk '
+      awk '
         BEGIN { added=0 }
         /^auth[[:space:]]+sufficient[[:space:]]+pam_rootok\.so/ {
           print $0
@@ -1778,7 +1915,7 @@ configure_pam_su_passwordless_for_wheel() {
       fi
       local injected
       injected="$(mktemp)"
-      sudo awk '
+      awk '
         BEGIN { added=0 }
         NR==1 && /^#%PAM-1\.0/ {
           print $0
@@ -1947,7 +2084,6 @@ root_unlock_standalone_for_root() {
   # /etc/pulse/client.conf, prefer a per-user config under /root/.config/pulse
   # instead of tweaking the system-wide file.
   local pulse_client_root="/root/.config/pulse/client.conf"
-  local pulse_client_system="/etc/pulse/client.conf"
   local tmp_pulse
 
   if [[ "$audio_stack" != "pulseaudio" && "$audio_stack" != "pipewire-pulse" && "$audio_stack" != "unknown" ]]; then
@@ -2235,7 +2371,6 @@ root_unlock_restore_mode() {
 
   local state_path="/etc/passwordless-fb-root-unlock.state"
   # Defaults if no state file is present or readable.
-  local START_TS=""
   local LINGER_BEFORE=""
   local PA_ENABLED_BEFORE=""
   local PA_ACTIVE_BEFORE=""
@@ -2244,8 +2379,8 @@ root_unlock_restore_mode() {
 
   if [[ -r "$state_path" ]]; then
     log "[root-unlock-restore] Loading state from $state_path..."
-    # shellcheck disable=SC1090
     set +u
+    # shellcheck disable=SC1090
     . "$state_path" || true
     set -u
   else
@@ -2261,9 +2396,19 @@ root_unlock_restore_mode() {
   if [[ "$dry_run" -eq 1 ]]; then
     log "[dry-run] Would look for *.bak.* backups of /root/.config/pulse, /root/.config/pipewire, /root/.local/state/wireplumber and move them back into place."
   else
-    local p latest
+    local p latest p_dir p_base candidate candidate_mtime latest_mtime
     for p in /root/.config/pulse /root/.config/pipewire /root/.local/state/wireplumber; do
-      latest="$(ls -1dt "${p}.bak."* 2>/dev/null | head -n1 || true)"
+      latest=""
+      latest_mtime=0
+      p_dir="$(dirname "$p")"
+      p_base="$(basename "$p").bak."
+      while IFS= read -r -d '' candidate; do
+        candidate_mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || echo 0)"
+        if [[ "$candidate_mtime" -gt "$latest_mtime" ]]; then
+          latest_mtime="$candidate_mtime"
+          latest="$candidate"
+        fi
+      done < <(find "$p_dir" -maxdepth 1 -name "${p_base}*" -print0 2>/dev/null)
       if [[ -n "$latest" ]]; then
         log "[root-unlock-restore] Restoring $p from backup $latest..."
         sudo rm -rf "$p" 2>/dev/null || true
@@ -2813,6 +2958,10 @@ maybe_delete_password_for_target_user
 
 # KDE integration: make the GUI "Run as root" helper use sudo instead of su.
 configure_kdesu_for_sudo
+# GDebi integration: auto-detect and patch the known pkexec GUI environment
+# loss issue only when needed.
+log "[info] Checking whether GDebi pkexec display-env patch is needed..."
+patch_gdebi_pkexec_display_env_if_needed
 
 # PAM integration: make 'su' passwordless for users in the 'wheel' group.
 log "[info] Adjusting PAM su configuration (if compatible) to allow passwordless su for wheel users..."
