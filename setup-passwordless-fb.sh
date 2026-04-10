@@ -500,6 +500,96 @@ ensure_sudoers_permissions() {
   done
 }
 
+detect_recent_polkit_agent_helper_permission_failures() {
+  # Best-effort detector for the known auth dialog failure:
+  # "Incorrect permissions on .../polkit-agent-helper-1 (needs to be setuid root)".
+  # Returns 0 when a recent matching journal entry is found, 1 otherwise.
+  local recent_hits=""
+
+  if ! have_cmd journalctl; then
+    return 1
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would scan journal for recent polkit-agent-helper-1 permission errors."
+    return 1
+  fi
+
+  recent_hits="$(sudo journalctl -b --no-pager --grep='Incorrect permissions on .*/polkit-agent-helper-1' -n 5 2>/dev/null || true)"
+  if [[ -n "$recent_hits" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+ensure_polkit_agent_helper_permissions() {
+  # Repair polkit helper ownership/mode when needed.
+  # Expected state for the helper binary is root:root with mode 4755.
+  local helper=""
+  local candidate=""
+  local owner=""
+  local group=""
+  local mode=""
+  local needs_fix=0
+  local root_mount_opts=""
+
+  # Surface known failure signatures first so users can correlate what happened.
+  if detect_recent_polkit_agent_helper_permission_failures; then
+    warn "[polkit-helper-fix] Detected recent polkit-agent-helper-1 permission failure in the journal."
+  fi
+
+  for candidate in /usr/lib/polkit-1/polkit-agent-helper-1 /usr/lib/policykit-1/polkit-agent-helper-1; do
+    if sudo test -e "$candidate"; then
+      helper="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$helper" ]]; then
+    warn "[polkit-helper-fix] polkit-agent-helper-1 not found in common locations; skipping helper permission repair."
+    return 0
+  fi
+
+  owner="$(sudo stat -c '%U' "$helper" 2>/dev/null || echo "")"
+  group="$(sudo stat -c '%G' "$helper" 2>/dev/null || echo "")"
+  mode="$(sudo stat -c '%a' "$helper" 2>/dev/null || echo "")"
+
+  if [[ "$owner" != "root" || "$group" != "root" || "$mode" != "4755" ]]; then
+    needs_fix=1
+  fi
+
+  if [[ "$needs_fix" -eq 0 ]]; then
+    log "[polkit-helper-fix] $helper already has correct permissions (root:root 4755)."
+  else
+    warn "[polkit-helper-fix] Incorrect permissions on $helper (current=${owner:-?}:${group:-?} ${mode:-?}; expected=root:root 4755)."
+    if [[ "$dry_run" -eq 1 ]]; then
+      log "[dry-run] Would run: sudo chown root:root \"$helper\""
+      log "[dry-run] Would run: sudo chmod 4755 \"$helper\""
+    else
+      sudo chown root:root "$helper"
+      sudo chmod 4755 "$helper"
+    fi
+
+    owner="$(sudo stat -c '%U' "$helper" 2>/dev/null || echo "")"
+    group="$(sudo stat -c '%G' "$helper" 2>/dev/null || echo "")"
+    mode="$(sudo stat -c '%a' "$helper" 2>/dev/null || echo "")"
+    if [[ "$owner" == "root" && "$group" == "root" && "$mode" == "4755" ]]; then
+      log "[polkit-helper-fix] Repaired $helper -> root:root 4755."
+    else
+      warn "[polkit-helper-fix] Post-fix state is still unexpected for $helper (${owner:-?}:${group:-?} ${mode:-?})."
+    fi
+  fi
+
+  # Additional smart signal: even correct file mode will fail if filesystem is mounted nosuid.
+  if have_cmd findmnt; then
+    root_mount_opts="$(findmnt -no OPTIONS / 2>/dev/null || echo "")"
+    if [[ "$root_mount_opts" == *nosuid* ]]; then
+      warn "[polkit-helper-fix] Root filesystem is mounted with nosuid; polkit helper setuid may still fail."
+    fi
+  fi
+}
+
 ensure_main_sudoers_has_user_nopasswd() {
   # Ensure /etc/sudoers itself also has a NOPASSWD line for TARGET_USER.
   # This is in addition to the drop-in in /etc/sudoers.d, and uses visudo
@@ -1653,11 +1743,21 @@ patch_gdebi_pkexec_display_env_if_needed() {
   local gdebi_py="/usr/share/gdebi/GDebi/GDebiGtk.py"
   local tmp
   local patch_rc=0
+  local recent_hits=""
 
   # If gdebi is not installed, nothing to do.
   if ! sudo test -f "$gdebi_py"; then
     log "[gdebi-fix] $gdebi_py not found; skipping display-env compatibility patch."
     return 0
+  fi
+
+  # Best-effort: surface recent crash signatures so users can see why this
+  # patch path is being considered.
+  if have_cmd journalctl && [[ "$dry_run" -eq 0 ]]; then
+    recent_hits="$(sudo journalctl -b --no-pager --grep='GtkStyleContext|display connection|gdebi-gtk|GDebiGtk|Traceback' -n 120 2>/dev/null | grep -Ei 'GtkStyleContext|display connection|gdebi-gtk.*Traceback|GDebiGtk' || true)"
+    if [[ -n "$recent_hits" ]]; then
+      warn "[gdebi-fix] Detected recent gdebi/pkexec crash signatures in journal; evaluating display-env compatibility patch."
+    fi
   fi
 
   # Detect already-patched content first.
@@ -1667,14 +1767,8 @@ patch_gdebi_pkexec_display_env_if_needed() {
     return 0
   fi
 
-  # Detect unpatched layout we know how to modify safely.
-  if ! sudo grep -Fq 'gdebi_args = ["gdebi-gtk", "--non-interactive",' "$gdebi_py"; then
-    warn "[gdebi-fix] Unsupported GDebi layout detected in $gdebi_py; skipping auto-patch to avoid unsafe edits."
-    return 0
-  fi
-
   if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would patch $gdebi_py to preserve DISPLAY/Wayland/DBUS environment through pkexec."
+    log "[dry-run] Would evaluate and patch $gdebi_py (if needed) to preserve DISPLAY/Wayland/DBUS environment through pkexec."
     return 0
   fi
 
@@ -1692,48 +1786,67 @@ patch_gdebi_pkexec_display_env_if_needed() {
 
   if python3 - "$tmp" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
+if "env_keys = (" in text and 'gdebi_args = ["env"] + env_args + [' in text:
+    sys.exit(10)
 
-old = """            gdebi_args = [\"gdebi-gtk\", \"--non-interactive\",
-                          self._deb.filename]
+replacement_template = """{i}pkexec_cmd = "/usr/bin/pkexec"
+{i}env_keys = (
+{i}    "DISPLAY",
+{i}    "XAUTHORITY",
+{i}    "WAYLAND_DISPLAY",
+{i}    "XDG_RUNTIME_DIR",
+{i}    "DBUS_SESSION_BUS_ADDRESS",
+{i}    "XDG_SESSION_TYPE",
+{i}    "GDK_BACKEND",
+{i}    "QT_QPA_PLATFORM",
+{i})
+{i}env_args = []
+{i}for key in env_keys:
+{i}    value = os.environ.get(key)
+{i}    if value:
+{i}        env_args.append("%s=%s" % (key, value))
+{i}gdebi_args = ["env"] + env_args + [
+{i}    "gdebi-gtk", "--non-interactive", self._deb.filename
+{i}]
 """
 
-new = """            env_keys = (
-                \"DISPLAY\",
-                \"XAUTHORITY\",
-                \"WAYLAND_DISPLAY\",
-                \"XDG_RUNTIME_DIR\",
-                \"DBUS_SESSION_BUS_ADDRESS\",
-                \"XDG_SESSION_TYPE\",
-                \"GDK_BACKEND\",
-                \"QT_QPA_PLATFORM\",
-            )
-            env_args = []
-            for key in env_keys:
-                value = os.environ.get(key)
-                if value:
-                    env_args.append(\"%s=%s\" % (key, value))
-            gdebi_args = [\"env\"] + env_args + [
-                \"gdebi-gtk\", \"--non-interactive\", self._deb.filename
-            ]
-"""
+patterns = [
+    re.compile(
+        r'(?ms)^(?P<i>[ \t]*)pkexec_cmd = "/usr/bin/pkexec"\n'
+        r'(?P=i)gdebi_args = \["gdebi-gtk", "--non-interactive",[ \t]*\n'
+        r'(?P=i)[ \t]*self\._deb\.filename\]\n'
+    ),
+    re.compile(
+        r'(?m)^(?P<i>[ \t]*)pkexec_cmd = "/usr/bin/pkexec"\n'
+        r'(?P=i)gdebi_args = \["gdebi-gtk", "--non-interactive", self\._deb\.filename\]\n'
+    ),
+]
 
-if old not in text:
-    sys.exit(42)
+for pat in patterns:
+    match = pat.search(text)
+    if match:
+      indent = match.group("i")
+      new_block = replacement_template.format(i=indent)
+      text = text[:match.start()] + new_block + text[match.end():]
+      path.write_text(text, encoding="utf-8")
+      sys.exit(0)
 
-text = text.replace(old, new, 1)
-path.write_text(text, encoding="utf-8")
+sys.exit(42)
 PY
   then
     :
   else
     patch_rc=$?
     rm -f "$tmp" 2>/dev/null || true
-    if [[ "$patch_rc" -eq 42 ]]; then
-      warn "[gdebi-fix] Expected unpatched block was not found during patching; file may already be modified. Skipping."
+    if [[ "$patch_rc" -eq 10 ]]; then
+      log "[gdebi-fix] Patch already present in temporary copy; skipping."
+    elif [[ "$patch_rc" -eq 42 ]]; then
+      warn "[gdebi-fix] Unsupported or unexpected GDebi layout detected in $gdebi_py; skipping auto-patch to avoid unsafe edits."
     else
       warn "[gdebi-fix] Failed to patch $gdebi_py (python exit=$patch_rc); skipping."
     fi
@@ -1759,7 +1872,7 @@ PY
   fi
   rm -f "$tmp" 2>/dev/null || true
 
-  if python3 -m py_compile "$gdebi_py" >/dev/null 2>&1; then
+  if sudo python3 -m py_compile "$gdebi_py" >/dev/null 2>&1; then
     log "[gdebi-fix] Patched $gdebi_py and verified syntax."
   else
     warn "[gdebi-fix] Patch installed, but post-install syntax check failed for $gdebi_py."
@@ -2810,6 +2923,11 @@ VISUDO_BIN="$(find_visudo)"
 # Ensure core sudoers files have safe permissions so visudo -c does not
 # fail with "bad permissions, should be mode 0440".
 ensure_sudoers_permissions
+# Detect and repair known polkit helper permission breakage before verify/setup.
+# Skip in restore mode so restore/uninstall remains side-effect free.
+if [[ "$restore_mode" -eq 0 ]]; then
+  ensure_polkit_agent_helper_permissions
+fi
 
 log "[info] Target user: $TARGET_USER"
 

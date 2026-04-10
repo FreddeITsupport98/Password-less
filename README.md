@@ -120,6 +120,8 @@ If you do not fully understand or accept these risks, **do not run this script**
   - Backs up existing files with timestamped `.bak.<timestamp>` suffix when overwriting (only when `--force` is used)
   - Refuses to do unsafe things by default (e.g. doesn’t overwrite existing config unless you explicitly ask it to)
   - Auto-detects and (only when needed) patches a known `gdebi-gtk` pkexec GUI display-environment issue, with `.orig` backup and manifest-based restore compatibility
+  - Uses smart GDebi patch detection: checks current file state, handles multiple unpatched `pkexec` argument layouts, and surfaces recent related crash signatures from the current boot journal before applying a safe patch
+  - Smart-detects recent `polkit-agent-helper-1` permission failures from the current boot journal and auto-repairs helper ownership/mode to `root:root 4755` when needed, with a warning if `/` is mounted `nosuid`
 
 ---
 
