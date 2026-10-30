@@ -17,7 +17,12 @@ export LANG=C
 
 SCRIPT_NAME="$(basename "$0")"
 
+# Version of this script. Bump this on every change and log the change in
+# CHANGELOG.md next to the script.
+SCRIPT_VERSION="1.0.0"
+
 usage() {
+  printf '%s %s\n\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
   cat <<'EOF'
 Usage:
   setup-passwordless-fb.sh [--user USER] [--sudo-only] [--no-install] [--yes] [--force] [--dry-run] [--full-file-permissions] [--install-full-file-permissions-service] [--uninstall-full-file-permissions-service] [--root-unlock] [--all-groups] [--delete-passwd-on-polkit-fail] [--default-config] [--uninstall]
@@ -498,6 +503,84 @@ ensure_sudoers_permissions() {
       fi
     fi
   done
+
+  # Also normalize every drop-in under /etc/sudoers.d (and /usr/etc/sudoers.d
+  # where present). Distro tooling sometimes installs sudoers drop-ins with an
+  # unsafe owner/mode (e.g. SparkyLinux's /etc/sudoers.d/sparkyupdate); sudo
+  # and visudo then refuse to load them ("bad permissions, should be mode
+  # 0440"), and a full `visudo -c` exits non-zero, which used to abort this
+  # script halfway through the setup with no explanation. Repairing these
+  # files is safe and idempotent: root:root 0440 is the only state sudo
+  # accepts for drop-in files.
+  # Only regular files are processed (symlinks are skipped) and file contents
+  # are never modified, so this is intentionally NOT recorded in the uninstall
+  # manifest: undoing a permission repair would only re-break sudo.
+  local sudoers_dir dropin
+  for sudoers_dir in /etc/sudoers.d /usr/etc/sudoers.d; do
+    if ! sudo test -d "$sudoers_dir"; then
+      continue
+    fi
+    while IFS= read -r -d '' dropin; do
+      # Skip anything that vanished between find and stat.
+      if ! sudo test -e "$dropin"; then
+        continue
+      fi
+      owner=$(sudo stat -c '%U' "$dropin" 2>/dev/null || echo "")
+      group=$(sudo stat -c '%G' "$dropin" 2>/dev/null || echo "")
+      mode=$(sudo stat -c '%a' "$dropin" 2>/dev/null || echo "")
+      if [[ "$owner" != "root" || "$group" != "root" || "$mode" != "440" ]]; then
+        warn "Fixing permissions on $dropin (owner=${owner:-?}:${group:-?} mode=${mode:-?}, expected root:root 440)..."
+        if [[ "$dry_run" -eq 1 ]]; then
+          log "[dry-run] Would chown root:root \"$dropin\" and chmod 0440 \"$dropin\""
+        else
+          sudo chown root:root "$dropin" 2>/dev/null || warn "Could not chown $dropin"
+          sudo chmod 0440 "$dropin" 2>/dev/null || warn "Could not chmod 0440 $dropin"
+        fi
+      fi
+    done < <(sudo find "$sudoers_dir" -maxdepth 1 -type f -print0 2>/dev/null)
+  done
+}
+
+validate_full_sudoers_config() {
+  # Run a full `visudo -c` (this checks /etc/sudoers plus every drop-in under
+  # /etc/sudoers.d) after our drop-in was installed, and react sensibly:
+  #   - If the failure involves OUR managed drop-in ($SUDOERS_DEST), abort:
+  #     something we wrote is bad and must not be left in place silently.
+  #   - If the failure comes from a pre-existing file this script did not touch
+  #     (bad permissions or a syntax error from distro tooling, e.g. a broken
+  #     /etc/sudoers.d/sparkyupdate), print what visudo reported and continue:
+  #     our own file was already validated standalone before install, and
+  #     aborting mid-run used to leave the setup half-finished (sudoers
+  #     drop-in installed, but verification and the polkit steps never ran)
+  #     with a bare exit code 1 and no explanation.
+  local check_output=""
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    log "[dry-run] Would validate full sudoers via: sudo $VISUDO_BIN -c"
+    return 0
+  fi
+
+  if check_output="$(sudo "$VISUDO_BIN" -c 2>&1)"; then
+    # Mirror visudo's per-file "parsed OK" output, like the old direct call.
+    if [[ -n "$check_output" ]]; then
+      printf '%s\n' "$check_output"
+    fi
+    return 0
+  fi
+
+  # Validation failed somewhere: show exactly what visudo reported.
+  printf '%s\n' "$check_output" >&2
+
+  # Only treat it as fatal when OUR managed drop-in is the file that failed
+  # (a "parsed OK" line for our file does not count as a failure mention).
+  if [[ -n "${SUDOERS_DEST:-}" ]] && \
+     printf '%s\n' "$check_output" | grep -F "${SUDOERS_DEST}:" | grep -Fvq 'parsed OK'; then
+    die "Full sudoers validation failed and involves our file $SUDOERS_DEST; not continuing. Review /etc/sudoers.d/ manually."
+  fi
+
+  warn "Full sudoers validation failed due to a pre-existing sudoers file (see visudo output above); our drop-in $SUDOERS_DEST was validated OK on its own."
+  warn "Continuing with the remaining setup steps. Repair the file reported above (e.g. sudo chmod 0440 <file> or fix its syntax) if you want a fully clean 'visudo -c'."
+  return 0
 }
 
 detect_recent_polkit_agent_helper_permission_failures() {
@@ -3012,7 +3095,9 @@ fi
 if [[ "$dry_run" -eq 1 ]]; then
   log "[dry-run] Would validate sudoers temp via: sudo $VISUDO_BIN -c -f $SUDOERS_TMP"
 else
-  sudo "$VISUDO_BIN" -c -f "$SUDOERS_TMP"
+  if ! sudo "$VISUDO_BIN" -c -f "$SUDOERS_TMP"; then
+    die "Sudoers drop-in content for $TARGET_USER failed visudo validation; not installing anything."
+  fi
 fi
 
 if [[ "$sudoers_already_ok" -eq 1 ]]; then
@@ -3021,11 +3106,9 @@ else
   write_root_file "$SUDOERS_TMP" "$SUDOERS_DEST" 0440
 
   # Validate full sudoers config only if we changed something.
-  if [[ "$dry_run" -eq 1 ]]; then
-    log "[dry-run] Would validate full sudoers via: sudo $VISUDO_BIN -c"
-  else
-    sudo "$VISUDO_BIN" -c
-  fi
+  # (Pre-existing breakage in files we did not touch is reported but no longer
+  # aborts the whole run; see validate_full_sudoers_config.)
+  validate_full_sudoers_config
 fi
 
 # Verify passwordless sudo works for the target user.
